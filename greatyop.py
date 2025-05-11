@@ -2,68 +2,117 @@ import re
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
+from slugify import slugify # It's python-slugify not slugify (pip3 install python-slugify not pip3 install slugify)
 import icecream as ic
 
-headers = {
-'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36'
-}
+class GreatYopScraper:
+    def __init__(self, index_url, days_back=30, threshold=0.7):
+        self.index_url        = index_url
+        self.days_back        = days_back
+        self.threshold        = threshold
+        self.latest_url       = None
+        self.links            = []
+        self.raw              = []
+        self.normalized       = []
+        self.slugs            = []
+        self.slug_tokens      = []
+        self.unique_urls      = []
+        self.duplicates       = []
 
-def get_latest_post_sitemap(index_url):
-    """Fetch sitemap_index.xml, find all post-sitemapN.xml, and return the URL with the highest N."""
+        self.headers = {
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/113.0.0.0 Safari/537.36'
+            )
+        }
 
+    def get_latest_post_sitemap(self):
+        """Fetch the sitemap_index and pick the post-sitemap with the highest value of N."""
+        resp = requests.get(self.index_url, headers=self.headers)
+        parser = 'lxml-xml' if 'xml' in resp.headers.get('Content-Type', '') else 'html.parser'
+        soup = BeautifulSoup(resp.content, parser)
 
+        max_n = -1
+        for loc in soup.find_all('loc'):
+            m = re.search(r'post-sitemap(\d*)\.xml$', loc.text)
+            if m:
+                n = int(m.group(1) or 0)
+                if n > max_n:
+                    max_n = n
+                    self.latest_url = loc.text
 
-    resp = requests.get(index_url, headers=headers)
+        ic.ic(self.latest_url)
+        if not self.latest_url:
+            raise RuntimeError("No post-sitemap found in index!")
+        return self.latest_url
 
+    def dump_recent_links(self):
+        """Extract only <loc> URLs with <lastmod> in the past `days_back` days."""
+        if not self.latest_url:
+            self.get_latest_post_sitemap()
 
-    content_type = resp.headers.get('Content-Type', '')
-    parser = 'lxml-xml' if 'text/xml' in content_type else 'html.parser'
-    soup = BeautifulSoup(resp.content, parser)
-    max_n = -1
-    latest_url = None
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.days_back)
+        soup = BeautifulSoup(requests.get(self.latest_url, headers=self.headers).content, 'lxml-xml')
 
-    for loc in soup.find_all('loc'):
-        m = re.search(r'post-sitemap(\d*)\.xml$', loc.text)
-        if m:
-            n = int(m.group(1)) if m.group(1) else 0 
-            if n > max_n:
-                max_n = n
-                latest_url = loc.text
-    ic.ic(latest_url)
+        self.links = []
+        for url in soup.find_all('url'):
+            lm = url.find('lastmod')
+            if not lm:
+                continue
+            if datetime.fromisoformat(lm.text) >= cutoff:
+                self.links.append(url.find('loc').text)
 
-    if not latest_url:
-        raise RuntimeError("No post-sitemap found in index!")
-    return latest_url
+        ic.ic(len(self.links))
+        return self.links
 
-def dump_recent_links(sitemap_url, output_file, days_back=30):
-    """Extract only <loc> URLs with <lastmod> in the past `days_back` days."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
-    soup   = BeautifulSoup(requests.get(sitemap_url, headers=headers).content, 'lxml-xml')
-    
+    @staticmethod
+    def normalize_url(link):
+        return link.lower().rstrip('/')
 
-    links = []
-    links.append(str(cutoff) +  '\n')
-    for url in soup.find_all('url'):
-        lm = url.find('lastmod')
-        if not lm:
-            continue
-        dt = datetime.fromisoformat(lm.text)
-        if dt >= cutoff:
-            links.append(url.find('loc').text)
+    @staticmethod
+    def slugify_links(u):
+        seg = u.split("/")[-1]
+        s   = slugify(seg)
+        return re.sub(r'-(\d{4}|\d{4}-\d{2}-\d{2})$', '', s)
 
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(links))
+    @staticmethod
+    def jaccard(a, b):
+        return len(a & b) / len(a | b) if (a or b) else 0.0
+
+    def process(self):
+        """Full pipeline: detect sitemap → dump recent → normalize → slugify → deduplicate."""
+        # Fetch & filter
+        self.dump_recent_links()
+
+        # Clean & normalize
+        self.raw        = [ln.strip() for ln in self.links if ln.strip()]
+        self.normalized = [self.normalize_url(ln) for ln in self.raw]
+
+        # Slugify & tokenize
+        self.slugs       = [self.slugify_links(ln) for ln in self.normalized]
+        self.slug_tokens = [set(slug.split('-')) for slug in self.slugs]
+
+        # Deduplicate by Jaccard with seen_tokens
+        self.unique_urls = []
+        self.duplicates  = []
+        seen_tokens      = []
+
+        for link, tokens in zip(self.normalized, self.slug_tokens):
+            if not any(self.jaccard(tokens, prev) >= self.threshold for prev in seen_tokens):
+                self.unique_urls.append(link)
+                seen_tokens.append(tokens)
+            else:
+                self.duplicates.append(link)
+
+        # ic.ic(self.duplicates)
+        return self.unique_urls, self.duplicates
 
 if __name__ == '__main__':
-    INDEX_URL = 'https://greatyop.com/sitemap_index.xml'
-
-    # 1. Auto‑detect newest post-sitemap  
-    latest = get_latest_post_sitemap(INDEX_URL)
-    print(f"✨ Found latest post-sitemap: {latest}")
-
-    # 2. Dump only last 30‑days’ links from that sitemap
-    
-    dump_recent_links(latest, 'greatyop-last30d-links.txt')
-
-
-
+    scraper = GreatYopScraper(
+        index_url='https://greatyop.com/sitemap_index.xml',
+        days_back=30,
+        threshold=0.7
+    )
+    unique, dup = scraper.process()
+    print(f"Unique URLs: {len(unique)}, Duplicates: {len(dup)}")

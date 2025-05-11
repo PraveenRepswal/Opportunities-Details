@@ -1,90 +1,100 @@
-import os
 import requests
 from bs4 import BeautifulSoup
-import json
-from datetime import datetime
-import time
-import re
-import icecream as ic
 from datetime import datetime, timedelta, timezone
+import re
 from slugify import slugify
+import icecream as ic
 
+class OpportunitiesCorners:
+    def __init__(self, sitemap_url, days_back=30, threshold=0.7):
+        self.sitemap_url = sitemap_url
+        self.days_back   = days_back
+        self.threshold   = threshold
+        self.links       = []
+        self.raw         = []
+        self.normalized  = []
+        self.slugs       = []
+        self.slug_tokens = []
+        self.unique_urls = []
+        self.duplicates  = []
 
-def dump_links(sitemap_url, days_back=30):
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
-    soup   = BeautifulSoup(requests.get(sitemap_url).content, 'lxml-xml')
+    def dump_links(self):
+        headers = {
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/113.0.0.0 Safari/537.36'
+            )
+        }
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.days_back)
+        soup   = BeautifulSoup(
+            requests.get(self.sitemap_url, headers=headers).content,
+            'lxml-xml'
+        )
 
-    links = []
-    for url in soup.find_all('url'):
-        lm  = url.find('lastmod')
-        loc = url.find('loc').text
-        if lm and datetime.fromisoformat(lm.text) >= cutoff:
-            links.append(loc)
+        self.links = []
+        for url in soup.find_all('url'):
+            lm  = url.find('lastmod')
+            loc = url.find('loc').text
+            if lm and datetime.fromisoformat(lm.text) >= cutoff:
+                self.links.append(loc)
 
-    # with open(output_file, 'w', encoding='utf-8') as f:
-    #     f.write('\n'.join(links))\
-    ic.ic(links)
-    return links
+        ic.ic(len(self.links))
+        return self.links
 
+    @staticmethod
+    def normalize_url(link):
+        return link.lower().rstrip('/')
 
+    @staticmethod
+    def slugify_links(u):
+        seg = u.split("/")[-1]
+        s   = slugify(seg)
+        return re.sub(r'-(\d{4}|\d{4}-\d{2}-\d{2})$', '', s)
 
+    @staticmethod
+    def jaccard(a, b):
+        return len(a & b) / len(a | b) if a or b else 0.0
 
-def normalize_url(link):
-    return link.lower().rstrip('/')
+    def process(self):
+        # Fetch & filter
+        self.dump_links()
 
+        # Clean & normalize
+        self.raw        = [ln.strip() for ln in self.links if ln.strip()]
+        self.normalized = [self.normalize_url(ln) for ln in self.raw]
 
-def slugify_links(u):
-    seg = u.split("/")[-1]
-    s   = slugify(seg)
-    # remove trailing 4‑digit years or full dates
-    return re.sub(r'-(\d{4}|\d{4}-\d{2}-\d{2})$', '', s)
+        # Slugify & tokenize
+        self.slugs       = [self.slugify_links(ln) for ln in self.normalized]
+        self.slug_tokens = [set(slug.split('-')) for slug in self.slugs]
 
+        # Deduplicate by Jaccard with seen_tokens
+        self.unique_urls = []
+        self.duplicates  = []
+        seen_tokens      = []
 
+        for link, tokens in zip(self.normalized, self.slug_tokens):
+            # compare against token that were already accepted
+            if not any(self.jaccard(tokens, prev) >= self.threshold for prev in seen_tokens):
+                self.unique_urls.append(link)
+                seen_tokens.append(tokens)
+            else:
+                self.duplicates.append(link)
 
+        # ic.ic(self.duplicates)
+        return self.unique_urls, self.duplicates
 
-#Jaccard function to compare two sets   
-def jaccard(a, b):
-    return len(a&b) / len(a|b) 
-
-
+    # def save(self, filepath='testSLUG.txt'):
+    #     with open(filepath, 'w', encoding='utf-8') as f:
+    #         f.write('\n'.join(self.unique_urls))
 
 
 if __name__ == '__main__':
-    dump_links(
-        'https://opportunitiescorners.com/post-sitemap.xml',
-        'opportunitiescorners-month-links.txt'
+    oc = OpportunitiesCorners(
+        sitemap_url='https://opportunitiescorners.com/post-sitemap.xml',
+        days_back=30,
+        threshold=0.7
     )
-
-# with open('opportunitiescorners-month-links.txt', 'r', encoding='utf-8') as f:
-#     raw = [link.strip() for link in f if link.strip()]
-
-# norm_link = [normalize_url(link) for link in raw]
-
-
-
-
-# slugs = [slugify_links(link) for link in norm_link]
-
-# slug_tokens = [set(s.split('-')) for s in slugs]
-
-
-
-
-
-threshold = 0.6
-unique_urls = []
-seen_tokens = []
-duplicate = []
-
-# for link, tokens in zip(norm_link, slug_tokens):
-    
-#     # check if this tokens set is too similar to any we've kept
-#     if not any(jaccard(tokens, prev) >= threshold for prev in seen_tokens):
-#         unique_urls.append(link)
-#         seen_tokens.append(tokens)
-#     else:
-#         duplicate.append(link)
-
-ic.ic(duplicate)
-with open('testSLUG.txt', 'w') as f:
-    f.write('\n'.join(unique_urls))
+    unique, dup = oc.process()
+    print(f"Unique URLs: {len(unique)}, Duplicates: {len(dup)}")
+    # oc.save('testSLUG.txt')
