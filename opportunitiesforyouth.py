@@ -2,7 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 import re
-from slugify import slugify  # make sure you've installed python-slugify
+from slugify import slugify
 
 class OpportunitiesForYouth:
     def __init__(self, sitemap_url, days_back=30, threshold=0.7):
@@ -71,14 +71,8 @@ class OpportunitiesForYouth:
             else:
                 self.duplicates.append(link)
 
-        return self.unique_urls, self.duplicates
+        return self.unique_urls
 
-    # def save(self, filepath='youth_links.txt'):
-    #     """Write unique URLs to a file."""
-    #     if not self.unique_urls:
-    #         self.process()
-    #     with open(filepath, 'w', encoding='utf-8') as f:
-    #         f.write('\n'.join(self.unique_urls))
 
 if __name__ == '__main__':
     ofy = OpportunitiesForYouth(
@@ -86,6 +80,6 @@ if __name__ == '__main__':
         days_back=30,
         threshold=0.7
     )
-    unique, dup = ofy.process()
-    print(f"Found {len(unique)} unique links, {len(dup)} duplicates.")
-    # ofy.save('opportunitiesforyouth-month-links.txt')
+    # unique, dup = ofy.process()
+    # print(f"Found {len(unique)} unique links, {len(dup)} duplicates.")
+

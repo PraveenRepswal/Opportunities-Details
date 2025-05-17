@@ -6,7 +6,7 @@ from slugify import slugify
 import icecream as ic
 
 class OpportunitiesCorners:
-    def __init__(self, sitemap_url, days_back=30, threshold=0.7):
+    def __init__(self, sitemap_url, days_back, threshold):
         self.sitemap_url = sitemap_url
         self.days_back   = days_back
         self.threshold   = threshold
@@ -39,7 +39,7 @@ class OpportunitiesCorners:
             if lm and datetime.fromisoformat(lm.text) >= cutoff:
                 self.links.append(loc)
 
-        ic.ic(len(self.links))
+        # ic.ic(len(self.links))
         return self.links
 
     @staticmethod
@@ -82,7 +82,7 @@ class OpportunitiesCorners:
                 self.duplicates.append(link)
 
         # ic.ic(self.duplicates)
-        return self.unique_urls, self.duplicates
+        return self.unique_urls
 
     # def save(self, filepath='testSLUG.txt'):
     #     with open(filepath, 'w', encoding='utf-8') as f:
@@ -90,11 +90,12 @@ class OpportunitiesCorners:
 
 
 if __name__ == '__main__':
-    oc = OpportunitiesCorners(
+    OpportunitiesCorners(
         sitemap_url='https://opportunitiescorners.com/post-sitemap.xml',
-        days_back=30,
+        days_back=30,   
         threshold=0.7
     )
-    unique, dup = oc.process()
-    print(f"Unique URLs: {len(unique)}, Duplicates: {len(dup)}")
+    # unique, dup = oc.process()
+    # print(f"Unique URLs: {len(unique)}, Duplicates: {len(dup)}")
+    # ic.ic(unique)
     # oc.save('testSLUG.txt')

@@ -108,7 +108,7 @@ class YouthOP:
                 self.duplicates.append(link)
 
         # ic.ic(self.duplicates)
-        return self.unique_urls, self.duplicates
+        return self.unique_urls
 
 if __name__ == '__main__':
     scraper = YouthOP(
@@ -116,7 +116,7 @@ if __name__ == '__main__':
         days_back=30,
         threshold=0.7
     )
-    unique, dup = scraper.process()
-    print(f"Unique URLs: {len(unique)}, Duplicates: {len(dup)}")
+    # unique, dup = scraper.process()
+    # print(f"Unique URLs: {len(unique)}, Duplicates: {len(dup)}")
 
 
