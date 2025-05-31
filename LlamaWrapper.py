@@ -1,36 +1,38 @@
-# from main import OpportunitiesCorners
-from test import OpportunitiesForYouth, OpportunitiesCorners
+from main import OpportunitiesCorners
+# from test import OpportunitiesForYouth, OpportunitiesCorners
 from ollama import ChatResponse, chat
 import streamlit as st
 import icecream as ic
 import os
 
 
-# sitemap_url = 'https://opportunitiescorners.com/post-sitemap.xml'
+sitemap_url = 'https://opportunitiescorners.com/post-sitemap.xml'
 days_back=30
 threshold=0.7
 
-# @st.cache_data
+@st.cache_data
 def get_data():
-    return OpportunitiesCorners(days_back, threshold).process(), OpportunitiesForYouth(days_back, threshold).process()
+    return OpportunitiesCorners(sitemap_url, days_back, threshold).getting_data()
 
 data = get_data()
-os.system("clear")   
+
+if os.name == 'nt':
+    os.system('cls')
+# For macOS and Linux
+else:
+    os.system('clear') 
+
 ic.ic(type(data))
-ic.ic("Data from 1st: ",len(data[0]), "Data form 2nd:", len(data[1]))
+ic.ic(data)
+ic.ic("Data from 1st: ",len(data[0]), "Data form 2nd:", len(data[1]), "Total len:", len(data))
 
-
-oc = OpportunitiesCorners(days_back, threshold)
-ic.ic("Using sitemap_url:", oc.sitemap_url)
-raw = oc.dump_links()
-ic.ic("Raw count:", len(raw))
 
 st.title("Test app")
 
 #History
 
 if "messages" not in st.session_state:
-    st.session_state.messages = [{'role': 'system', 'content': f'You are a helpful assistant that helps the user by giving answers related to {data}'}]
+    st.session_state.messages = [{'role': 'system', 'content': f'You are a helpful assistant that helps the user by giving answers related to the given data. Only give the answer from this data only. You have to atleast provide important details like eligibility, deadline, duration, location, have application fees or not, location along with other details only from the given data. Here is the given data: {data}'}]
 
 
 
@@ -54,8 +56,8 @@ prompt = st.chat_input("Enter your message here")
 button = st.button("Stop", key="stop")
 
 
-st.write("Raw length:", len(OpportunitiesCorners(days_back, threshold).dump_links()))
-st.write("After dedupe:", len(OpportunitiesCorners(days_back, threshold).process()))
+st.write("Raw length:", len(OpportunitiesCorners(sitemap_url, days_back, threshold).dump_links()))
+st.write("After dedupe:", len(OpportunitiesCorners(sitemap_url, days_back, threshold).process()))
 
 # opportunities = st.expander("OpportunitiesCorner")
 # with opportunities:
@@ -66,7 +68,7 @@ st.write("After dedupe:", len(OpportunitiesCorners(days_back, threshold).process
 
 
 if prompt:
-    ic.ic("Data from 1st: ",len(data[0]), "Data form 2nd:", len(data[1]))
+    # ic.ic("Data from 1st: ",len(data[0]), "Data form 2nd:", len(data[1]))
     
     st.session_state["messages"].append({"role": "user", "content": prompt})
 
