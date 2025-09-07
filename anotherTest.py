@@ -1,102 +1,88 @@
 from main import OpportunitiesCorners
-from ollama import ChatResponse, chat
+from ollama import Client
 import streamlit as st
-import icecream as ic
-import os
+import asyncio
+from sentence_transformers import SentenceTransformer, util
 
-
+# Config
 sitemap_url = 'https://opportunitiescorners.com/post-sitemap.xml'
-days_back=30
-threshold=0.7
+days_back = 30
+threshold = 0.7
 
+# 1) Load & cache your opportunity data
 @st.cache_data
 def get_data():
-    return OpportunitiesCorners(sitemap_url, days_back, threshold).getting_data()
+    return asyncio.run(
+        OpportunitiesCorners(sitemap_url, days_back, threshold)
+          .getting_data()
+    )
 
 data = get_data()
 
-if os.name == 'nt':
-    os.system('cls')
-# For macOS and Linux
-else:
-    os.system('clear') 
+# 2) Embed them once
+model = SentenceTransformer('all-MiniLM-L6-v2')
+data_embeddings = model.encode(data, convert_to_tensor=True)
 
-ic.ic(type(data))
-# ic.ic(data)
-ic.ic("Data from 1st: ",len(data[0]), "Data form 2nd:", len(data[1]), "Total len:", len(data))
-
-
+# 3) Streamlit UI
 st.title("Test app")
 
-#History
+# 4) Ollama client (cached)
+@st.cache_resource
+def ollama_client():
+    return Client()
 
-if "messages" not in st.session_state:
-    st.session_state.messages = [{'role': 'system', 'content': f''}]
-
-SYSTEM = """
-You are an extraction engine and strictly follow these rules: 
-- Your ONLY job is to output the exact requested information,and if the relevant information is not found then reply nothing else.  
-- If the chunk contains no relevant data, you MUST return a zero-length response (i.e. an empty string).  
-- DO NOT apologize. DO NOT explain. DO NOT say “there is no…” or suggest other actions if no relevant information is found.  
-- Your response must be strictly from the the data the user asked for, or literally nothing.
-- If you didn't find relevant information then either reply nothing(that means an empty string) or reply with only a single word 'None'.
-"""
-
-def AI(chunk_text: str, user_query: str) -> str:
-
-    prompt = (
-        f"User asks: {user_query}\n\n"
-        f"Here’s one opportunity:\n{chunk_text}\n\n"
-        f"— "
-    )
-    resp = chat(
+def stream_assistant():
+    client = ollama_client()
+    for chunk in client.chat(
         model="llama3.2",
-        messages=[
-            {"role": "system",  "content": SYSTEM},
-            {"role": "user",    "content": prompt}
-        ],
-        stream=False
-    )
-    return resp["message"]["content"]
+        messages=st.session_state.messages,
+        stream=True
+    ):
+        # each chunk is a dict: {"message": {"content": "..."}}
+        yield chunk["message"]["content"]
 
-def extract_from_data_chunks(data_chunks, user_query):
-
-    # replies = []
-    replies = ""
-    processed_chunks = 0
-    for entry in data_chunks:
-        chunk_text = entry["content"]
-        answer = AI(chunk_text, user_query)
-        if not answer or answer == "None":
-            continue
-        else:
-            # replies.append(answer)
-            replies += answer + "\n\n"
-        processed_chunks += 1
-        if processed_chunks % 10 == 0:
-            ic.ic(f"Processed {processed_chunks} chunks")
-    # return "\n\n".join(replies)
-    return replies.strip()  
-
-prompt = st.chat_input("Enter your message here")
-button = st.button("Stop", key="stop")
-
-st.write("After dedupe:", len(OpportunitiesCorners(sitemap_url, days_back, threshold).process()))
-
-
-if prompt:
-    # ic.ic("Data from 1st: ",len(data[0]), "Data form 2nd:", len(data[1]))
+# 5) Initialize the chat history with the top-1 context
+if "messages" not in st.session_state:
+    # dummy search to get the very first context
+    dummy_emb = model.encode("", convert_to_tensor=True)
+    top_hit = util.semantic_search(dummy_emb, data_embeddings, top_k=1)[0][0]
+    context_text = top_hit["text"]
     
-    st.session_state["messages"].append({"role": "user", "content": prompt})
+    st.session_state.messages = [{
+        "role": "system",
+        "content": (
+            "You are a helpful assistant. Only answer using the context below. "
+            "Include eligibility, deadline, duration, location, fees, etc. if they exist.\n\n"
+            f"{context_text}"
+        )
+    }]
 
+# 6) Accept user input
+prompt = st.chat_input("Enter your message here")
+if prompt:
+    # a) record & display the user's message
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.write(prompt)
 
-    with st.chat_message("assistant"):
-        message = extract_from_data_chunks(data, prompt)
-        st.write(message)
+    # b) run semantic search *for this* prompt, then update the system context
+    prompt_emb = model.encode(prompt, convert_to_tensor=True)
+    hit = util.semantic_search(prompt_emb, data_embeddings, top_k=1)[0][0]
+    new_context = hit["text"]
+    st.session_state.messages[0]["content"] = (
+        "You are a helpful assistant. Only answer using the context below.\n\n"
+        f"{new_context}"
+    )
 
-        if button:
-            st.session_state["messages"].append({"role": "assistant", "content": message})
-            st.stop()
-        st.session_state["messages"].append({"role": "assistant", "content": message})
+    # c) stream & display the assistant’s reply
+    full_reply = ""
+    with st.chat_message("assistant"):
+        for piece in stream_assistant():
+            st.write(piece)        # write each chunk as it arrives
+            full_reply += piece    # accumulate
+
+    # d) save it in history
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": full_reply
+    })

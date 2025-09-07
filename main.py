@@ -1,3 +1,4 @@
+import traceback
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
@@ -6,6 +7,8 @@ from slugify import slugify
 import icecream as ic
 import trafilatura
 import json
+import aiohttp
+import asyncio
 
 class OpportunitiesCorners:
     def __init__(self, sitemap_url, days_back, threshold):
@@ -90,33 +93,65 @@ class OpportunitiesCorners:
     #     with open(filepath, 'w', encoding='utf-8') as f:
     #         f.write('\n'.join(self.unique_urls))
 
-    ic.ic("Starting end process")
-    def getting_data(self):
-        self.process()
-        result = []
+    async def fetch_url(self, index, session, url):
         count = 0
-        for url in self.unique_urls:
-            try:
-                response = requests.get(url)
-                page_data = response.text
-                end_result = trafilatura.extract(page_data, include_comments=False)
-                if end_result:
-                    item = {
-                        "url": url,
-                        "content": end_result
-                    }
-                    result.append(item)
-                    count += 1
+        try:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                page_data = await response.text()
+            end_result = trafilatura.extract(page_data, include_comments=False)
+            name = self.slugs[index].replace("-", " ")
+            if end_result:
+                end_result = end_result.replace('\n', ' ')
+                count += 1
+                return {
+                    "name": name,
+                    "url": url,
+                    "content": end_result
+                }
+            ic.ic(f"Total processed: {count}")
+        except Exception as e:
+            print(f"Error processing {url}: {e}")
+            traceback.print_exc()
+        return None
+    
 
-            except Exception as e:
-                print(f"Error processing {url}: {e}")
-        with open("sample.txt", "a", encoding='utf-8') as f:
-            f.write(end_result + "\n\n\n")
+
+    async def getting_data(self):
+        ic.ic("Starting end process")
+        final_urls = self.process()
+        timeout = aiohttp.ClientTimeout(total=20)
+        connector = aiohttp.TCPConnector(limit=20, limit_per_host=7)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            tasks =  [self.fetch_url(index, session, url) for index, url in enumerate(final_urls)]
+            responses = await asyncio.gather(*tasks)
+            result  = [item for item in responses if item]
+
+            # for url in final_urls:
+            #     try:
+            #         # response = requests.get(url)
+            #         async with session.get(url) as response:
+            #             response.raise_for_status()
+            #             page_data = await response.text()
+            #         end_result = trafilatura.extract(page_data, include_comments=False)
+            #         if end_result:
+            #             item = {
+            #                 "url": url,
+            #                 "content": end_result
+            #             }
+            #             result.append(item)
+            #             count += 1
+            #     except Exception as e:
+            #         print(f"Error processing {url}: {e}")
+        # with open("sample.txt", "a", encoding='utf-8') as f:
+        #     f.write(end_result + "\n\n\n")
         with open("sampledict.txt", "w", encoding='utf-8') as f:
             json.dump(result, f, indent=2)
-        print(f"Total processed: {count}")
-        ic.ic(type(result))
-        ic.ic(type(result[0]))
+        ic.ic(f"Type of data: {type(result)}")
+        # print(f"Total processed: {count}")
+        # ic.ic(type(result))
+        # ic.ic(type(result[0]))
+        print(f"Type of result: {type(result)}")
         return result
 
 
@@ -130,5 +165,5 @@ if __name__ == '__main__':
     )
     # unique, dup = oc.process()
     # print(f"Unique URLs: {len(unique)}, Duplicates: {len(dup)}")
-    oc.getting_data()
+    asyncio.run(oc.getting_data())
     # oc.save('testSLUG.txt')

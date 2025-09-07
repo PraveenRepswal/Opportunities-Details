@@ -5,14 +5,22 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "aiohttp>=3.12.14",
     "bs4>=0.0.2",
     "icecream>=2.1.4",
     "lxml>=5.4.0",
     "ollama>=0.4.9",
     "python-slugify>=8.0.4",
+    "rapidfuzz>=3.14.0",
     "readability-lxml>=0.8.4.1",
     "requests>=2.32.3",
+    "sentence-transformers>=5.0.0",
     "streamlit>=1.45.1",
     "trafilatura>=2.0.0",
     "transformers>=4.52.3",
+]
+
+[dependency-groups]
+dev = [
+    "uv-bump>=0.2.0",
 ]
