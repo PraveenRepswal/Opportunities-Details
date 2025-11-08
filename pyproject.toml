@@ -3,11 +3,17 @@ name = "opportunities-details"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "aiohttp>=3.12.14",
     "bs4>=0.0.2",
+    "faiss-cpu>=1.9.0",
+    "gemma>=3.2.1",
     "icecream>=2.1.4",
+    "langchain>=0.3.27",
+    "langchain-community>=0.3.29",
+    "langchain-huggingface>=0.3.1",
+    "langchain-ollama>=0.3.8",
     "lxml>=5.4.0",
     "ollama>=0.4.9",
     "python-slugify>=8.0.4",

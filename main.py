@@ -32,8 +32,9 @@ class OpportunitiesCorners:
             )
         }
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.days_back)
+        ic.ic(f"Cutoff date: {cutoff}")
         soup   = BeautifulSoup(
-            requests.get(self.sitemap_url, headers=headers).content,
+            requests.get(self.sitemap_url, headers=headers, verify=False).content,
             'lxml-xml'
         )
 
@@ -41,10 +42,12 @@ class OpportunitiesCorners:
         for url in soup.find_all('url'):
             lm  = url.find('lastmod')
             loc = url.find('loc').text
-            if lm and datetime.fromisoformat(lm.text) >= cutoff:
-                self.links.append(loc)
+            if lm:
+                lastmod_date = datetime.fromisoformat(lm.text)
+                if lastmod_date >= cutoff:
+                    self.links.append(loc)
 
-        # ic.ic(len(self.links))
+        # ic.ic(f"Total links found: {len(self.links)}")
         return self.links
 
     @staticmethod
@@ -109,7 +112,7 @@ class OpportunitiesCorners:
                     "url": url,
                     "content": end_result
                 }
-            ic.ic(f"Total processed: {count}")
+            # ic.ic(f"Total processed: {count}")
         except Exception as e:
             print(f"Error processing {url}: {e}")
             traceback.print_exc()
@@ -118,10 +121,11 @@ class OpportunitiesCorners:
 
 
     async def getting_data(self):
-        ic.ic("Starting end process")
+        ic.ic("Getting Data")
         final_urls = self.process()
+        # ic.ic(f"Found {len(final_urls)} unique URLs to fetch")
         timeout = aiohttp.ClientTimeout(total=20)
-        connector = aiohttp.TCPConnector(limit=20, limit_per_host=7)
+        connector = aiohttp.TCPConnector(limit=20, limit_per_host=7, ssl=False)
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             tasks =  [self.fetch_url(index, session, url) for index, url in enumerate(final_urls)]
             responses = await asyncio.gather(*tasks)
@@ -147,11 +151,12 @@ class OpportunitiesCorners:
         #     f.write(end_result + "\n\n\n")
         with open("sampledict.txt", "w", encoding='utf-8') as f:
             json.dump(result, f, indent=2)
-        ic.ic(f"Type of data: {type(result)}")
+        # ic.ic(f"Type of data: {type(result)}")
         # print(f"Total processed: {count}")
         # ic.ic(type(result))
         # ic.ic(type(result[0]))
-        print(f"Type of result: {type(result)}")
+        # print(f"Type of result: {type(result)}")
+        print(f"Total items fetched: {len(result)}")
         return result
 
 
