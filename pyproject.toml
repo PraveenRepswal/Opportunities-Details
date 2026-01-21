@@ -1,29 +1,33 @@
 [project]
 name = "opportunities-details"
-version = "0.1.0"
+version = "0.5.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12,<3.14"
 dependencies = [
-    "aiohttp>=3.12.14",
+    "aiohttp>=3.13.2",
     "bs4>=0.0.2",
-    "faiss-cpu>=1.9.0",
+    "faiss-cpu>=1.12.0",
+    "fastapi>=0.128.0",
+    "flashrank>=0.2.10",
     "gemma>=3.2.1",
-    "icecream>=2.1.4",
-    "langchain>=0.3.27",
-    "langchain-community>=0.3.29",
-    "langchain-huggingface>=0.3.1",
-    "langchain-ollama>=0.3.8",
-    "lxml>=5.4.0",
-    "ollama>=0.4.9",
+    "icecream>=2.1.8",
+    "langchain>=1.0.7",
+    "langchain-community>=0.4.1",
+    "langchain-huggingface>=1.0.1",
+    "langchain-ollama>=1.0.0",
+    "lxml>=6.0.2",
+    "ollama>=0.6.1",
     "python-slugify>=8.0.4",
-    "rapidfuzz>=3.14.0",
+    "rapidfuzz>=3.14.3",
     "readability-lxml>=0.8.4.1",
-    "requests>=2.32.3",
-    "sentence-transformers>=5.0.0",
-    "streamlit>=1.45.1",
+    "requests>=2.32.5",
+    "sentence-transformers>=5.1.2",
+    "streamlit>=1.51.0",
+    "tiktoken>=0.12.0",
     "trafilatura>=2.0.0",
-    "transformers>=4.52.3",
+    "transformers>=4.57.1",
+    "uvicorn>=0.40.0",
 ]
 
 [dependency-groups]

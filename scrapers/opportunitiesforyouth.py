@@ -7,13 +7,11 @@ import icecream as ic
 import json
 import aiohttp
 import asyncio
-import traceback
 import trafilatura
-import time
 
 class OpportunitiesForYouth:
-    def __init__(self, sitemap_url, days_back=30, threshold=0.7):
-        self.sitemap_url = sitemap_url
+    def __init__(self, index_url, days_back=30, threshold=0.7):
+        self.index_url   = index_url
         self.days_back   = days_back
         self.threshold   = threshold
         self.links       = []
@@ -29,7 +27,7 @@ class OpportunitiesForYouth:
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36'
         }
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.days_back)
-        soup = BeautifulSoup(requests.get(self.sitemap_url, headers=headers).content, 'lxml-xml')
+        soup = BeautifulSoup(requests.get(self.index_url, headers=headers).content, 'lxml-xml')
 
         self.links = []
         for url in soup.find_all('url'):
@@ -94,7 +92,8 @@ class OpportunitiesForYouth:
                 response.raise_for_status()
                 page_data = await response.text()
             end_result = trafilatura.extract(page_data, include_comments=False)
-            name = self.slugs[index].replace("-", " ")
+            # Fix: Derive name directly from the URL to avoid index mismatch
+            name = self.slugify_links(url).replace("-", " ")
             if end_result:
                 end_result = end_result.replace('\n', ' ')
                 count += 1
@@ -104,15 +103,17 @@ class OpportunitiesForYouth:
                     "content": end_result
                 }
             # ic.ic(f"Total processed: {count}")
+        except asyncio.TimeoutError:
+            print(f"Error processing {url}: Timeout error")
+        except aiohttp.ClientError as e:
+            print(f"Error processing {url}: {type(e).__name__}")
         except Exception as e:
-            print(f"Error processing {url}: {e}")
-            traceback.print_exc()
+            print(f"Error processing {url}: {type(e).__name__}")
         return None
     
 
 
     async def getting_data(self):
-        ic.ic("Getting Data")
         final_urls = self.process()
         timeout = aiohttp.ClientTimeout(total=30)
         # Use only 1 connection per host to avoid rate limiting (sequential)
@@ -122,18 +123,18 @@ class OpportunitiesForYouth:
             responses = await asyncio.gather(*tasks)
             result  = [item for item in responses if item]
 
-        with open("sampleofydict.txt", "w", encoding='utf-8') as f:
-            json.dump(result, f, indent=2)
-        print(f"Total items fetched: {len(result)}")
+        # with open("sampleofydict.txt", "w", encoding='utf-8') as f:
+        #     json.dump(result, f, indent=2)
+        print(f"Total items fetched | opportunitiesforyouth: {len(result)}")
         return result
 
 if __name__ == '__main__':
     ofy = OpportunitiesForYouth(
-        sitemap_url='https://opportunitiesforyouth.org/sitemap-1.xml',
+        index_url='https://opportunitiesforyouth.org/sitemap-1.xml',
         days_back=30,
         threshold=0.7
     )
     # unique, dup = ofy.process()
     # print(f"Found {len(unique)} unique links, {len(dup)} duplicates.")
-    asyncio.run(ofy.getting_data())
+    # asyncio.run(ofy.getting_data())
 

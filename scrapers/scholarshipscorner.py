@@ -4,6 +4,11 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 import icecream as ic
 from slugify import slugify
+import asyncio
+import trafilatura
+import traceback
+import aiohttp
+import json
 
 class ScholarshipsCorner:
     def __init__(self, index_url, days_back=30, threshold=0.7):
@@ -27,11 +32,13 @@ class ScholarshipsCorner:
             )
         }
 
-    def get_latest_post_sitemap(self):
+    async def get_latest_post_sitemap(self, session):
         """Fetch the sitemap_index and pick the post-sitemap with the highest value of N."""
-        resp = requests.get(self.index_url, headers=self.headers)
-        parser = 'lxml-xml' if 'xml' in resp.headers.get('Content-Type', '') else 'html.parser'
-        soup = BeautifulSoup(resp.content, parser)
+        async with session.get(self.index_url, headers=self.headers, ssl=False) as resp:
+            content = await resp.read()
+            ctype = resp.headers.get('Content-Type', '')
+            parser = 'lxml-xml' if 'xml' in ctype else 'html.parser'
+            soup = BeautifulSoup(content, parser)
 
         max_n = -1
         for loc in soup.find_all('loc'):
@@ -47,21 +54,30 @@ class ScholarshipsCorner:
             raise RuntimeError("No post-sitemap found in index!")
         return self.latest_url
 
-    def dump_recent_links(self):
+    async def dump_recent_links(self, session):
         """Extract only <loc> URLs with <lastmod> in the past `days_back` days."""
         if not self.latest_url:
-            self.get_latest_post_sitemap()
+            await self.get_latest_post_sitemap(session)
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.days_back)
-        soup = BeautifulSoup(requests.get(self.latest_url, headers=self.headers).content, 'lxml-xml')
+        
+        async with session.get(self.latest_url, headers=self.headers, ssl=False) as resp:
+            content = await resp.read()
+            soup = BeautifulSoup(content, 'lxml-xml')
 
         self.links = []
         for url in soup.find_all('url'):
             lm = url.find('lastmod')
             if not lm:
                 continue
-            if datetime.fromisoformat(lm.text) >= cutoff:
-                self.links.append(url.find('loc').text)
+            try:
+                dt = datetime.fromisoformat(lm.text)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt >= cutoff:
+                    self.links.append(url.find('loc').text)
+            except ValueError:
+                continue
 
         ic.ic(len(self.links))
         return self.links
@@ -80,10 +96,10 @@ class ScholarshipsCorner:
     def jaccard(a, b):
         return len(a & b) / len(a | b) if (a or b) else 0.0
 
-    def process(self):
+    async def process(self, session):
         """Full pipeline: detect sitemap → dump recent → normalize → slugify → deduplicate."""
         # Fetch & filter
-        self.dump_recent_links()
+        await self.dump_recent_links(session)
 
         # Clean & normalize
         self.raw        = [ln.strip() for ln in self.links if ln.strip()]
@@ -107,6 +123,54 @@ class ScholarshipsCorner:
 
         # ic.ic(self.duplicates)
         return self.unique_urls
+    
+    async def fetch_url(self, index, session, url):
+        count = 0
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36'
+        }
+        try:
+            # Add delay to avoid rate limiting
+            await asyncio.sleep(1.0)
+            async with session.get(url, headers=headers, ssl=False) as response:
+                response.raise_for_status()
+                page_data = await response.text()
+            end_result = trafilatura.extract(page_data, include_comments=False)
+            # Fix: Derive name directly from the URL to avoid index mismatch
+            name = self.slugify_links(url).replace("-", " ")
+            if end_result:
+                end_result = end_result.replace('\n', ' ')
+                count += 1
+                return {
+                    "name": name,
+                    "url": url,
+                    "content": end_result
+                }
+            # ic.ic(f"Total processed: {count}")
+        except asyncio.TimeoutError:
+            print(f"Error processing {url}: Timeout error")
+        except aiohttp.ClientError as e:
+            print(f"Error processing {url}: {type(e).__name__}")
+        except Exception as e:
+            print(f"Error processing {url}: {type(e).__name__}")
+        return None
+    
+
+
+    async def getting_data(self):
+        timeout = aiohttp.ClientTimeout(total=50)
+        # Use limit per host to avoid rate limiting, but allow some concurrency
+        connector = aiohttp.TCPConnector(limit=10, limit_per_host=10, ssl=False)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            final_urls = await self.process(session)
+            tasks =  [self.fetch_url(index, session, url) for index, url in enumerate(final_urls)]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            result  = [item for item in responses if item and not isinstance(item, Exception)]
+
+        # with open("sampleofydict.txt", "w", encoding='utf-8') as f:
+        #     json.dump(result, f, indent=2)
+        print(f"Total items fetched | scholarshipscorner.py: {len(result)}")
+        return result
 
 if __name__ == '__main__':
     scraper = ScholarshipsCorner(

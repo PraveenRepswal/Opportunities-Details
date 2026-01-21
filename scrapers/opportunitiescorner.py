@@ -1,4 +1,3 @@
-import traceback
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
@@ -11,10 +10,18 @@ import aiohttp
 import asyncio
 
 class OpportunitiesCorners:
-    def __init__(self, sitemap_url, days_back, threshold):
-        self.sitemap_url = sitemap_url
+    def __init__(self, index_url, days_back, threshold):
+        self.index_url   = index_url
         self.days_back   = days_back
         self.threshold   = threshold
+        self.headers = {
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/113.0.0.0 Safari/537.36'
+            )
+        }
+        self.latest_url  = None
         self.links       = []
         self.raw         = []
         self.normalized  = []
@@ -23,31 +30,56 @@ class OpportunitiesCorners:
         self.unique_urls = []
         self.duplicates  = []
 
+    def get_latest_post_sitemap(self):
+        """Fetch the sitemap_index and pick the post-sitemap with the highest value of N."""
+        resp = requests.get(self.index_url, headers=self.headers)
+        parser = 'lxml-xml' if 'xml' in resp.headers.get('Content-Type', '') else 'html.parser'
+        soup = BeautifulSoup(resp.content, parser)
+
+        max_n = -1
+        for loc in soup.find_all('loc'):
+            m = re.search(r'post-sitemap(\d*)\.xml$', loc.text)
+            if m:
+                n = int(m.group(1) or 0)
+                if n > max_n:
+                    max_n = n
+                    self.latest_url = loc.text
+
+        ic.ic(self.latest_url)
+        if not self.latest_url:
+            raise RuntimeError("No post-sitemap found in index!")
+        return self.latest_url
+
     def dump_links(self):
-        headers = {
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/113.0.0.0 Safari/537.36'
-            )
-        }
+        if not self.latest_url:
+            self.get_latest_post_sitemap()
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.days_back)
         ic.ic(f"Cutoff date: {cutoff}")
-        soup   = BeautifulSoup(
-            requests.get(self.sitemap_url, headers=headers, verify=False).content,
-            'lxml-xml'
-        )
+        
+        try:
+            response = requests.get(self.latest_url, headers=self.headers, verify=False)
+            response.raise_for_status()
+            
+            # Check if the response is XML or HTML
+            content_type = response.headers.get('Content-Type', '')
+            if 'xml' in content_type or response.content.strip().startswith(b'<?xml'):
+                soup = BeautifulSoup(response.content, 'lxml-xml')
+            else:
+                # Fallback for HTML sitemaps (like Yoast sometimes serves)
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+        except Exception as e:
+            ic.ic(f"Error fetching sitemap: {e}")
+            return []
 
         self.links = []
+        
+        # Handle standard XML sitemap
         for url in soup.find_all('url'):
             lm  = url.find('lastmod')
             loc = url.find('loc').text
-            if lm:
-                lastmod_date = datetime.fromisoformat(lm.text)
-                if lastmod_date >= cutoff:
-                    self.links.append(loc)
-
-        # ic.ic(f"Total links found: {len(self.links)}")
+            if lm and datetime.fromisoformat(lm.text) >= cutoff:
+                self.links.append(loc)
         return self.links
 
     @staticmethod
@@ -103,7 +135,8 @@ class OpportunitiesCorners:
                 response.raise_for_status()
                 page_data = await response.text()
             end_result = trafilatura.extract(page_data, include_comments=False)
-            name = self.slugs[index].replace("-", " ")
+            # Fix: Derive name directly from the URL to avoid index mismatch
+            name = self.slugify_links(url).replace("-", " ")
             if end_result:
                 end_result = end_result.replace('\n', ' ')
                 count += 1
@@ -113,15 +146,17 @@ class OpportunitiesCorners:
                     "content": end_result
                 }
             # ic.ic(f"Total processed: {count}")
+        except asyncio.TimeoutError:
+            print(f"Error processing {url}: Timeout error")
+        except aiohttp.ClientError as e:
+            print(f"Error processing {url}: {type(e).__name__}")
         except Exception as e:
-            print(f"Error processing {url}: {e}")
-            traceback.print_exc()
+            print(f"Error processing {url}: {type(e).__name__}")
         return None
     
 
 
     async def getting_data(self):
-        ic.ic("Getting Data")
         final_urls = self.process()
         # ic.ic(f"Found {len(final_urls)} unique URLs to fetch")
         timeout = aiohttp.ClientTimeout(total=20)
@@ -149,14 +184,14 @@ class OpportunitiesCorners:
             #         print(f"Error processing {url}: {e}")
         # with open("sample.txt", "a", encoding='utf-8') as f:
         #     f.write(end_result + "\n\n\n")
-        with open("sampledict.txt", "w", encoding='utf-8') as f:
-            json.dump(result, f, indent=2)
+        # with open("opportunitiescorner.txt", "w", encoding='utf-8') as f:
+        #     json.dump(result, f, indent=2)
         # ic.ic(f"Type of data: {type(result)}")
         # print(f"Total processed: {count}")
         # ic.ic(type(result))
         # ic.ic(type(result[0]))
         # print(f"Type of result: {type(result)}")
-        print(f"Total items fetched: {len(result)}")
+        print(f"Total items fetched | opportunitiescorners: {len(result)}")
         return result
 
 
@@ -164,7 +199,7 @@ class OpportunitiesCorners:
 
 if __name__ == '__main__':
     oc = OpportunitiesCorners(
-        sitemap_url='https://opportunitiescorners.com/post-sitemap.xml',
+        index_url='https://opportunitiescorners.com/sitemap_index.xml',
         days_back=30,   
         threshold=0.7
     )

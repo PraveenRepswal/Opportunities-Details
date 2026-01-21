@@ -1,0 +1,124 @@
+import asyncio
+import json
+import time
+from scrapers.greatyop import GreatYopScraper
+from scrapers.scholars4dev import Scholars4Dev
+from scrapers.scholarshipscorner import ScholarshipsCorner
+from scrapers.youthop import YouthOP
+from scrapers.opportunitiescorner import OpportunitiesCorners
+from scrapers.opportunitiesforyouth import OpportunitiesForYouth
+import icecream as ic
+
+class CombinedScraper:
+    def __init__(self, days_back=30, threshold=0.7):
+        self.days_back = days_back
+        self.threshold = threshold
+        
+    async def run_all_scrapers(self):
+        """Run all scrapers concurrently and combine results"""
+        ic.ic("Starting combined scraping process for scraper two")
+        
+        
+        # Create instances of all scrapers
+        youthop_scraper = YouthOP(
+            index_url='https://www.youthop.com/sitemap_index.xml',
+            days_back=self.days_back,
+            threshold=self.threshold
+        )
+        greatyop_scraper = GreatYopScraper(
+            index_url='https://greatyop.com/sitemap_index.xml',
+            days_back=self.days_back,
+            threshold=self.threshold
+        )
+        scholars4dev_scraper = Scholars4Dev(
+            index_url='https://www.scholars4dev.com/sitemap.xml',
+            days_back=self.days_back,
+            threshold=self.threshold
+        )
+        scholarshipscorner_scraper = ScholarshipsCorner(
+            index_url='https://scholarshipscorner.website/sitemap_index.xml',
+            days_back=self.days_back,
+            threshold=self.threshold
+        )
+        opportunitiescorner = OpportunitiesCorners(
+            index_url='https://opportunitiescorners.com/sitemap_index.xml',
+            days_back=self.days_back,
+            threshold=self.threshold
+        )
+        opportunitiesforyouth = OpportunitiesForYouth(
+            index_url='https://opportunitiesforyouth.org/sitemap-1.xml',
+            days_back=self.days_back,
+            threshold=self.threshold
+        )
+    
+        ic.ic("Fetching data from all sources concurrently...")
+
+        youthop_data, greatyop_data, scholars4dev_data, scholarshipscorner_data, opportunitiescorner_data, opportunitiesforyouth_data = await asyncio.gather(
+            asyncio.wait_for(youthop_scraper.getting_data(), timeout=70),
+            asyncio.wait_for(greatyop_scraper.getting_data(), timeout=60),
+            asyncio.wait_for(scholars4dev_scraper.getting_data(), timeout=60),
+            asyncio.wait_for(scholarshipscorner_scraper.getting_data(), timeout=60),
+            asyncio.wait_for(opportunitiescorner.getting_data(), timeout=60),
+            asyncio.wait_for(opportunitiesforyouth.getting_data(), timeout=60),
+            return_exceptions=True  # Don't fail if one scraper fails
+        )
+
+        if isinstance(youthop_data, Exception):
+            ic.ic(f"YouthOP failed: {youthop_data}")
+            youthop_data = []
+        
+        if isinstance(greatyop_data, Exception):
+            ic.ic(f"GreatYopScraper failed: {greatyop_data}")
+            greatyop_data = []
+
+        if isinstance(scholars4dev_data, Exception):
+            ic.ic(f"Scholars4Dev failed: {scholars4dev_data}")
+            scholars4dev_data = []
+        
+        if isinstance(scholarshipscorner_data, Exception):
+            ic.ic(f"ScholarshipsCorner failed: {scholarshipscorner_data}")
+            scholarshipscorner_data = []
+        
+        if isinstance(opportunitiesforyouth_data, Exception):
+            ic.ic(f"OpportunitiesForYouth failed: {opportunitiesforyouth_data}")
+            opportunitiesforyouth_data = []
+
+        if isinstance(opportunitiescorner_data, Exception):
+            ic.ic(f"OpportunitiesCorners failed: {opportunitiescorner_data}")
+            opportunitiescorner_data = []
+
+        # Combine the results
+        combined_results = youthop_data + greatyop_data + scholars4dev_data + scholarshipscorner_data + opportunitiescorner_data + opportunitiesforyouth_data
+
+        ic.ic("type of combined_results:", type(combined_results))
+
+        with open("scraped_data.txt", "w", encoding='utf-8') as f:
+            json.dump(combined_results, f, indent=2)
+
+        print(f"\n{'='*60}")
+        print(f"SCRAPING SUMMARY")
+        print(f"{'='*60}")
+        print(f"Source: YouthOP              | Items: {len(youthop_data):3d}")
+        print(f"Source: GreatYop             | Items: {len(greatyop_data):3d}")
+        print(f"Source: Scholars4Dev         | Items: {len(scholars4dev_data):3d}")
+        print(f"Source: ScholarshipsCorner   | Items: {len(scholarshipscorner_data):3d}")        
+        print(f"Source: OpportunitiesCorners | Items: {len(opportunitiescorner_data):3d}")
+        print(f"Source: OpportunitiesForYouth| Items: {len(opportunitiesforyouth_data):3d}")
+        print(f"{'='*60}")
+        print(f"Total Combined Opportunities | Items: {len(combined_results):3d}")
+        print(f"{'='*60}")
+        print(f"Output File: combined_scraper_two_results.txt")
+        print(f"{'='*60}\n")
+
+        return combined_results
+    
+async def main():
+    scraper = CombinedScraper(
+        days_back=30,
+        threshold=0.7
+    )
+    results = await scraper.run_all_scrapers()
+    return results
+
+if __name__ == "__main__":
+    asyncio.run(main())

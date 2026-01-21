@@ -1,5 +1,5 @@
 .venv
 __pycache__
-od
 .python-version
 uv.lock
+test.py
