@@ -19,11 +19,13 @@ import unicodedata
 from scraper import CombinedScraper
 from langchain_community.vectorstores.utils import DistanceStrategy
 import json
+from config import settings
 
 # Constants
-DAYS_BACK = 30
-SCORE_THRESHOLD = 0.2
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DAYS_BACK = settings.scraper.days_back
+SCORE_THRESHOLD = settings.scraper.score_threshold
+# EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL = settings.model.embedding_model
 CURRENT_DATE_STR = datetime.date.today().strftime("%d/%B/%Y")
 
 st.set_page_config(page_title="Opportunity Chatbot", page_icon="🎓")

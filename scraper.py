@@ -7,10 +7,11 @@ from scrapers.scholarshipscorner import ScholarshipsCorner
 from scrapers.youthop import YouthOP
 from scrapers.opportunitiescorner import OpportunitiesCorners
 from scrapers.opportunitiesforyouth import OpportunitiesForYouth
+from config import settings
 import icecream as ic
 
 class CombinedScraper:
-    def __init__(self, days_back=30, threshold=0.7):
+    def __init__(self, days_back=settings.scraper.days_back, threshold=settings.scraper.score_threshold):
         self.days_back = days_back
         self.threshold = threshold
         
@@ -21,32 +22,32 @@ class CombinedScraper:
         
         # Create instances of all scrapers
         youthop_scraper = YouthOP(
-            index_url='https://www.youthop.com/sitemap_index.xml',
+            index_url=settings.scraper.urls["youthop"],
             days_back=self.days_back,
             threshold=self.threshold
         )
         greatyop_scraper = GreatYopScraper(
-            index_url='https://greatyop.com/sitemap_index.xml',
+            index_url=settings.scraper.urls["greatyop"],
             days_back=self.days_back,
             threshold=self.threshold
         )
         scholars4dev_scraper = Scholars4Dev(
-            index_url='https://www.scholars4dev.com/sitemap.xml',
+            index_url=settings.scraper.urls["scholars4dev"],
             days_back=self.days_back,
             threshold=self.threshold
         )
         scholarshipscorner_scraper = ScholarshipsCorner(
-            index_url='https://scholarshipscorner.website/sitemap_index.xml',
+            index_url=settings.scraper.urls["scholarshipscorner"],
             days_back=self.days_back,
             threshold=self.threshold
         )
         opportunitiescorner = OpportunitiesCorners(
-            index_url='https://opportunitiescorners.com/sitemap_index.xml',
+            index_url=settings.scraper.urls["opportunitiescorner"],
             days_back=self.days_back,
             threshold=self.threshold
         )
         opportunitiesforyouth = OpportunitiesForYouth(
-            index_url='https://opportunitiesforyouth.org/sitemap-1.xml',
+            index_url=settings.scraper.urls["opportunitiesforyouth"],
             days_back=self.days_back,
             threshold=self.threshold
         )
