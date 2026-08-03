@@ -22,19 +22,28 @@ class OpportunitiesForYouth:
         self.unique_urls = []
         self.duplicates  = []
 
-    def dump_links(self):
+    async def dump_links(self, session):
         headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36'
         }
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.days_back)
-        soup = BeautifulSoup(requests.get(self.index_url, headers=headers).content, 'lxml-xml')
+        async with session.get(self.index_url, headers=headers) as resp:
+            content = await resp.read()
+        soup = BeautifulSoup(content, 'lxml-xml')
 
         self.links = []
         for url in soup.find_all('url'):
             lm  = url.find('lastmod')
-            loc = url.find('loc').text
-            if lm and datetime.fromisoformat(lm.text) >= cutoff:
-                self.links.append(loc)
+            loc = url.find('loc')
+            if lm and loc:
+                try:
+                    dt = datetime.fromisoformat(lm.text)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if dt >= cutoff:
+                        self.links.append(loc.text)
+                except ValueError:
+                    continue
         return self.links
 
     @staticmethod
@@ -52,9 +61,9 @@ class OpportunitiesForYouth:
     def jaccard(a, b):
         return len(a & b) / len(a | b) if (a or b) else 0.0
 
-    def process(self):
+    async def process(self, session):
         # Fetch & filter
-        self.dump_links()
+        await self.dump_links(session)
 
         # Clean & normalize
         self.raw        = [ln.strip() for ln in self.links if ln.strip()]
@@ -83,11 +92,13 @@ class OpportunitiesForYouth:
     async def fetch_url(self, index, session, url):
         count = 0
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
         }
         try:
-            # Add delay to avoid rate limiting
-            await asyncio.sleep(1.0)
+            # Stagger delays based on index to ensure a clean 2-second gap between requests
+            await asyncio.sleep(index * 2.0)
             async with session.get(url, headers=headers) as response:
                 response.raise_for_status()
                 page_data = await response.text()
@@ -114,11 +125,12 @@ class OpportunitiesForYouth:
 
 
     async def getting_data(self):
-        final_urls = self.process()
-        timeout = aiohttp.ClientTimeout(total=30)
+        # Allow sufficient time for the staggered sequential requests
+        timeout = aiohttp.ClientTimeout(total=90)
         # Use only 1 connection per host to avoid rate limiting (sequential)
         connector = aiohttp.TCPConnector(limit=1, limit_per_host=1, ssl=False)
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            final_urls = await self.process(session)
             tasks =  [self.fetch_url(index, session, url) for index, url in enumerate(final_urls)]
             responses = await asyncio.gather(*tasks)
             result  = [item for item in responses if item]

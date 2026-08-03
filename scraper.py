@@ -17,7 +17,7 @@ class CombinedScraper:
         
     async def run_all_scrapers(self):
         """Run all scrapers concurrently and combine results"""
-        ic.ic("Starting combined scraping process for scraper two")
+        ic.ic("Starting combined opportunity scraping pipeline...")
         
         
         # Create instances of all scrapers
@@ -96,6 +96,14 @@ class CombinedScraper:
         with open("scraped_data.txt", "w", encoding='utf-8') as f:
             json.dump(combined_results, f, indent=2)
 
+        # Upsert into SQLite database
+        try:
+            from backend.database import upsert_opportunities
+            saved_count = upsert_opportunities(combined_results)
+            ic.ic(f"Upserted {saved_count} opportunities to SQLite database.")
+        except Exception as err:
+            ic.ic(f"Error saving to SQLite database: {err}")
+
         print(f"\n{'='*60}")
         print(f"SCRAPING SUMMARY")
         print(f"{'='*60}")
@@ -108,7 +116,7 @@ class CombinedScraper:
         print(f"{'='*60}")
         print(f"Total Combined Opportunities | Items: {len(combined_results):3d}")
         print(f"{'='*60}")
-        print(f"Output File: combined_scraper_two_results.txt")
+        print(f"Output File: scraped_data.txt & SQLite Database")
         print(f"{'='*60}\n")
 
         return combined_results

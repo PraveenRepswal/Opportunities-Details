@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: opportunities_backend
+    restart: unless-stopped
+    command: ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - MODEL__MAIN_MODEL=/app/models/Qwen3.5-4B-IQ4_NL.gguf
+    volumes:
+      - sqlite_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: opportunities_frontend
+    restart: unless-stopped
+    command: ["streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    ports:
+      - "8501:8501"
+    environment:
+      - BACKEND_API_BASE_URL=http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: opportunities_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_storage:/root/.ollama
+
+volumes:
+  sqlite_data:
+    driver: local
+  ollama_storage:
+    driver: local

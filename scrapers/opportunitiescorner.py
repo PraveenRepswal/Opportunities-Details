@@ -30,11 +30,13 @@ class OpportunitiesCorners:
         self.unique_urls = []
         self.duplicates  = []
 
-    def get_latest_post_sitemap(self):
+    async def get_latest_post_sitemap(self, session):
         """Fetch the sitemap_index and pick the post-sitemap with the highest value of N."""
-        resp = requests.get(self.index_url, headers=self.headers)
-        parser = 'lxml-xml' if 'xml' in resp.headers.get('Content-Type', '') else 'html.parser'
-        soup = BeautifulSoup(resp.content, parser)
+        async with session.get(self.index_url, headers=self.headers) as resp:
+            content = await resp.read()
+            content_type = resp.headers.get('Content-Type', '')
+        parser = 'lxml-xml' if 'xml' in content_type else 'html.parser'
+        soup = BeautifulSoup(content, parser)
 
         max_n = -1
         for loc in soup.find_all('loc'):
@@ -50,23 +52,24 @@ class OpportunitiesCorners:
             raise RuntimeError("No post-sitemap found in index!")
         return self.latest_url
 
-    def dump_links(self):
+    async def dump_links(self, session):
         if not self.latest_url:
-            self.get_latest_post_sitemap()
+            await self.get_latest_post_sitemap(session)
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.days_back)
         ic.ic(f"Cutoff date: {cutoff}")
         
         try:
-            response = requests.get(self.latest_url, headers=self.headers, verify=False)
-            response.raise_for_status()
+            async with session.get(self.latest_url, headers=self.headers) as response:
+                response.raise_for_status()
+                content = await response.read()
+                content_type = response.headers.get('Content-Type', '')
             
             # Check if the response is XML or HTML
-            content_type = response.headers.get('Content-Type', '')
-            if 'xml' in content_type or response.content.strip().startswith(b'<?xml'):
-                soup = BeautifulSoup(response.content, 'lxml-xml')
+            if 'xml' in content_type or content.strip().startswith(b'<?xml'):
+                soup = BeautifulSoup(content, 'lxml-xml')
             else:
                 # Fallback for HTML sitemaps (like Yoast sometimes serves)
-                soup = BeautifulSoup(response.content, 'html.parser')
+                soup = BeautifulSoup(content, 'html.parser')
                 
         except Exception as e:
             ic.ic(f"Error fetching sitemap: {e}")
@@ -77,9 +80,18 @@ class OpportunitiesCorners:
         # Handle standard XML sitemap
         for url in soup.find_all('url'):
             lm  = url.find('lastmod')
-            loc = url.find('loc').text
-            if lm and datetime.fromisoformat(lm.text) >= cutoff:
-                self.links.append(loc)
+            loc = url.find('loc')
+            if loc:
+                loc_text = loc.text
+                if lm:
+                    try:
+                        dt = datetime.fromisoformat(lm.text)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        if dt >= cutoff:
+                            self.links.append(loc_text)
+                    except ValueError:
+                        continue
         return self.links
 
     @staticmethod
@@ -96,9 +108,9 @@ class OpportunitiesCorners:
     def jaccard(a, b):
         return len(a & b) / len(a | b) if a or b else 0.0
 
-    def process(self):
+    async def process(self, session):
         # Fetch & filter
-        self.dump_links()
+        await self.dump_links(session)
 
         # Clean & normalize
         self.raw        = [ln.strip() for ln in self.links if ln.strip()]
@@ -157,11 +169,11 @@ class OpportunitiesCorners:
 
 
     async def getting_data(self):
-        final_urls = self.process()
         # ic.ic(f"Found {len(final_urls)} unique URLs to fetch")
         timeout = aiohttp.ClientTimeout(total=20)
         connector = aiohttp.TCPConnector(limit=20, limit_per_host=7, ssl=False)
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            final_urls = await self.process(session)
             tasks =  [self.fetch_url(index, session, url) for index, url in enumerate(final_urls)]
             responses = await asyncio.gather(*tasks)
             result  = [item for item in responses if item]

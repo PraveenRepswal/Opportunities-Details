@@ -1,6 +1,44 @@
-.venv
-__pycache__
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
 .python-version
 uv.lock
-test.py
+
+# Byte-compiled / Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Environment & Secrets
+.env
+.env.local
+*.env
+
+# Local Databases, Vector Stores & Scraped Data
+*.db
+opportunities_chat.db
 scraped_data.txt
+faiss_store/
+models/
+
+# Scratch & Benchmark Files
+scratch_*
+test.py
+
+# IDEs & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Generated Files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

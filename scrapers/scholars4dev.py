@@ -35,11 +35,13 @@ class Scholars4Dev:
             )
         }
 
-    def get_latest_post_sitemap(self):
+    async def get_latest_post_sitemap(self, session):
         """Fetch the sitemap_index and pick the post-sitemap with the highest value of N."""
-        resp = requests.get(self.index_url, headers=self.headers)
-        parser = 'lxml-xml' if 'xml' in resp.headers.get('Content-Type', '') else 'html.parser'
-        soup = BeautifulSoup(resp.content, parser)
+        async with session.get(self.index_url, headers=self.headers) as resp:
+            content = await resp.read()
+            content_type = resp.headers.get('Content-Type', '')
+        parser = 'lxml-xml' if 'xml' in content_type else 'html.parser'
+        soup = BeautifulSoup(content, parser)
 
         max_n = -1
         for loc in soup.find_all('loc'):
@@ -55,21 +57,31 @@ class Scholars4Dev:
             raise RuntimeError("No post-sitemap found in index!")
         return self.latest_url
 
-    def dump_recent_links(self):
+    async def dump_recent_links(self, session):
         """Extract only <loc> URLs with <lastmod> in the past `days_back` days."""
         if not self.latest_url:
-            self.get_latest_post_sitemap()
+            await self.get_latest_post_sitemap(session)
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.days_back)
-        soup = BeautifulSoup(requests.get(self.latest_url, headers=self.headers).content, 'lxml-xml')
+        async with session.get(self.latest_url, headers=self.headers) as resp:
+            content = await resp.read()
+        soup = BeautifulSoup(content, 'lxml-xml')
 
         self.links = []
         for url in soup.find_all('url'):
             lm = url.find('lastmod')
             if not lm:
                 continue
-            if datetime.fromisoformat(lm.text) >= cutoff:
-                self.links.append(url.find('loc').text)
+            loc = url.find('loc')
+            if loc:
+                try:
+                    dt = datetime.fromisoformat(lm.text)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if dt >= cutoff:
+                        self.links.append(loc.text)
+                except ValueError:
+                    continue
 
         ic.ic(len(self.links))
         return self.links
@@ -88,10 +100,10 @@ class Scholars4Dev:
     def jaccard(a, b):
         return len(a & b) / len(a | b) if (a or b) else 0.0
 
-    def process(self):
+    async def process(self, session):
         """Full pipeline: detect sitemap → dump recent → normalize → slugify → deduplicate."""
         # Fetch & filter
-        self.dump_recent_links()
+        await self.dump_recent_links(session)
 
         # Clean & normalize
         self.raw        = [ln.strip() for ln in self.links if ln.strip()]
@@ -149,11 +161,11 @@ class Scholars4Dev:
 
 
     async def getting_data(self):
-        final_urls = self.process()
         timeout = aiohttp.ClientTimeout(total=30)
         # Use only 1 connection per host to avoid rate limiting (sequential)
         connector = aiohttp.TCPConnector(limit=1, limit_per_host=1, ssl=False)
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            final_urls = await self.process(session)
             tasks =  [self.fetch_url(index, session, url) for index, url in enumerate(final_urls)]
             responses = await asyncio.gather(*tasks)
             result  = [item for item in responses if item]
