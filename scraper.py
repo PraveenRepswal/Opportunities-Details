@@ -1,6 +1,5 @@
 import asyncio
 import json
-import time
 from scrapers.greatyop import GreatYopScraper
 from scrapers.scholars4dev import Scholars4Dev
 from scrapers.scholarshipscorner import ScholarshipsCorner
@@ -14,6 +13,7 @@ class CombinedScraper:
     def __init__(self, days_back=settings.scraper.days_back, threshold=settings.scraper.score_threshold):
         self.days_back = days_back
         self.threshold = threshold
+        self.enrichment_task = None
         
     async def run_all_scrapers(self):
         """Run all scrapers concurrently and combine results"""
@@ -96,37 +96,70 @@ class CombinedScraper:
         with open("scraped_data.txt", "w", encoding='utf-8') as f:
             json.dump(combined_results, f, indent=2)
 
+        # Inline rules-based metadata extraction (fast, deterministic)
+        if settings.scraper.extract_metadata:
+            from backend.metadata_extractor import extract_metadata_rules
+            for item in combined_results:
+                item["metadata"] = extract_metadata_rules(
+                    item.get("name") or item.get("title") or "",
+                    item.get("content") or "",
+                )
+
         # Upsert into SQLite database
+        row_ids = []
         try:
             from backend.database import upsert_opportunities
-            saved_count = upsert_opportunities(combined_results)
-            ic.ic(f"Upserted {saved_count} opportunities to SQLite database.")
+            row_ids = upsert_opportunities(combined_results)
+            ic.ic(f"Upserted {len(row_ids)} opportunities to SQLite database.")
         except Exception as err:
             ic.ic(f"Error saving to SQLite database: {err}")
 
+        # Background LLM enrichment for opportunities with missing metadata fields
+        if settings.scraper.llm_enrichment and row_ids:
+            from backend.metadata_extractor import enrich_missing_metadata, find_missing_fields
+            incomplete = [
+                (row_id, item)
+                for row_id, item in zip(row_ids, combined_results)
+                if row_id != -1 and find_missing_fields(item.get("metadata"))
+            ]
+            if incomplete:
+                ic.ic(f"Scheduling LLM metadata enrichment for {len(incomplete)} opportunities...")
+                self.enrichment_task = asyncio.create_task(enrich_missing_metadata(incomplete))
+
         print(f"\n{'='*60}")
-        print(f"SCRAPING SUMMARY")
+        print("SCRAPING SUMMARY")
         print(f"{'='*60}")
         print(f"Source: YouthOP              | Items: {len(youthop_data):3d}")
         print(f"Source: GreatYop             | Items: {len(greatyop_data):3d}")
         print(f"Source: Scholars4Dev         | Items: {len(scholars4dev_data):3d}")
-        print(f"Source: ScholarshipsCorner   | Items: {len(scholarshipscorner_data):3d}")        
+        print(f"Source: ScholarshipsCorner   | Items: {len(scholarshipscorner_data):3d}")
         print(f"Source: OpportunitiesCorners | Items: {len(opportunitiescorner_data):3d}")
         print(f"Source: OpportunitiesForYouth| Items: {len(opportunitiesforyouth_data):3d}")
         print(f"{'='*60}")
         print(f"Total Combined Opportunities | Items: {len(combined_results):3d}")
         print(f"{'='*60}")
-        print(f"Output File: scraped_data.txt & SQLite Database")
+        print("Output File: scraped_data.txt & SQLite Database")
         print(f"{'='*60}\n")
 
         return combined_results
-    
+
+    async def await_enrichment(self):
+        """Wait for the background LLM metadata enrichment task, if scheduled."""
+        if self.enrichment_task is not None:
+            try:
+                await self.enrichment_task
+            except Exception as err:
+                ic.ic(f"Metadata enrichment failed: {err}")
+            finally:
+                self.enrichment_task = None
+
 async def main():
     scraper = CombinedScraper(
         days_back=30,
         threshold=0.7
     )
     results = await scraper.run_all_scrapers()
+    await scraper.await_enrichment()
     return results
 
 if __name__ == "__main__":

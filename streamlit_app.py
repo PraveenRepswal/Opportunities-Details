@@ -1,35 +1,321 @@
 import json
-import re
+import os
+import sys
 import uuid
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from config import settings
+
+# Parse CLI debug flag (e.g. streamlit run streamlit_app.py -- --debug) or environment variable
+CLI_DEBUG_FLAG: bool = (
+    "--debug" in sys.argv
+    or "-d" in sys.argv
+    or os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
+    or settings.debug
+)
 
 DEFAULT_API_URL = f"http://{settings.api.host}:{settings.api.port}"
 
 st.set_page_config(page_title="Opportunity Details RAG Platform", page_icon="🎓", layout="wide")
 
-# Custom CSS to perfectly center and pin chat_input fixed at the bottom of the screen
+# Custom CSS to perfectly align chat_input and Moonshine voice recorder at bottom of screen
 st.markdown("""
 <style>
-/* Perfectly center chat input box at bottom of viewport */
+:root {
+    --chat-bar-width: min(720px, calc(100vw - 220px));
+    --voice-bar-width: 115px;
+    --bar-gap: 10px;
+    --bar-height: 48px;
+    --bar-bottom: 20px;
+    --bar-bg: #262730;
+    --bar-border: 1px solid rgba(255, 255, 255, 0.15);
+    --bar-radius: 12px;
+    --bar-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+/* Position chat input box at bottom of viewport */
 div[data-testid="stChatInput"] {
     position: fixed !important;
-    bottom: 20px !important;
-    left: 55% !important;
-    transform: translateX(-50%) !important;
-    width: 65% !important;
-    max-width: 900px !important;
+    bottom: var(--bar-bottom) !important;
+    left: 50% !important;
+    transform: translateX(calc(-50% - (var(--voice-bar-width) + var(--bar-gap)) / 2)) !important;
+    width: var(--chat-bar-width) !important;
     z-index: 9999 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+}
+
+div[data-testid="stChatInput"] > div {
+    height: var(--bar-height) !important;
+    min-height: var(--bar-height) !important;
+    max-height: var(--bar-height) !important;
+    border-radius: var(--bar-radius) !important;
+    border: var(--bar-border) !important;
+    background-color: var(--bar-bg) !important;
+    box-shadow: var(--bar-shadow) !important;
+    padding: 0 8px 0 16px !important;
+    box-sizing: border-box !important;
+    display: flex !important;
+    flex-direction: column !important;
+    justify-content: center !important;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease !important;
+}
+
+div[data-testid="stChatInput"] > div:focus-within {
+    border-color: #ff4b4b !important;
+    box-shadow: 0 0 0 1px #ff4b4b, 0 2px 10px rgba(255, 75, 75, 0.2) !important;
+}
+
+div[data-testid="stChatInput"] > div > div {
+    width: 100% !important;
+    height: 100% !important;
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+    gap: 8px !important;
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+/* Hide empty file-upload (Dt) and empty recording (Lt) wrappers when not active */
+div[data-testid="stChatInput"] > div > div > div:empty,
+div[data-testid="stChatInput"] > div > div > div:not(:has(textarea)):not(:has(button)) {
+    display: none !important;
+    width: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    flex: 0 0 0 !important;
+}
+
+/* Textarea wrapper (Tt) */
+div[data-testid="stChatInput"] > div > div > div:has(textarea),
+div[data-testid="stChatInput"] [data-baseweb="textarea"],
+div[data-testid="stChatInput"] [data-baseweb="base-input"] {
+    flex: 1 !important;
+    height: 100% !important;
+    display: flex !important;
+    align-items: center !important;
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    box-shadow: none !important;
+    min-width: 0 !important;
+}
+
+div[data-testid="stChatInput"] textarea,
+textarea[data-testid="stChatInputTextArea"] {
+    height: 24px !important;
+    min-height: 24px !important;
+    max-height: 24px !important;
+    line-height: 24px !important;
+    font-size: 15px !important;
+    font-family: inherit !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    border: none !important;
+    outline: none !important;
+    background: transparent !important;
+    color: #f0f2f6 !important;
+    width: 100% !important;
+    resize: none !important;
+    box-sizing: border-box !important;
+    vertical-align: middle !important;
+    display: block !important;
+}
+
+div[data-testid="stChatInput"] textarea::placeholder,
+textarea[data-testid="stChatInputTextArea"]::placeholder {
+    color: rgba(250, 250, 250, 0.5) !important;
+    line-height: 24px !important;
+}
+
+/* Submit button wrapper (Ut) */
+div[data-testid="stChatInput"] > div > div > div:has(button) {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    height: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    flex-shrink: 0 !important;
+}
+
+div[data-testid="stChatInputSubmitButton"],
+button[data-testid="stChatInputSubmitButton"] {
+    height: 32px !important;
+    width: 32px !important;
+    min-width: 32px !important;
+    min-height: 32px !important;
+    border-radius: 8px !important;
+    background-color: rgba(255, 255, 255, 0.08) !important;
+    border: none !important;
+    color: #f0f2f6 !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    cursor: pointer !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    transition: background-color 0.2s ease !important;
+    align-self: center !important;
+    box-sizing: border-box !important;
+}
+
+button[data-testid="stChatInputSubmitButton"]:hover:not(:disabled) {
+    background-color: #ff4b4b !important;
+    color: #ffffff !important;
+}
+
+div[data-testid="stChatInput"] .stChatInputInstructions,
+div[data-testid="stChatInput"] #stChatInputInstructions {
+    display: none !important;
+}
+
+/* Position voice recorder microphone capsule directly beside chat input with exact matching dimensions */
+div[data-testid="stAudioInput"] {
+    position: fixed !important;
+    bottom: var(--bar-bottom) !important;
+    left: calc(50% + (var(--chat-bar-width) / 2) - ((var(--voice-bar-width) + var(--bar-gap)) / 2) + var(--bar-gap)) !important;
+    transform: none !important;
+    width: var(--voice-bar-width) !important;
+    min-width: var(--voice-bar-width) !important;
+    max-width: var(--voice-bar-width) !important;
+    height: var(--bar-height) !important;
+    min-height: var(--bar-height) !important;
+    max-height: var(--bar-height) !important;
+    z-index: 10000 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+}
+
+div[data-testid="stAudioInput"] label,
+div[data-testid="stAudioInput"] [data-testid="stWidgetLabel"] {
+    display: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    height: 0 !important;
+    width: 0 !important;
+    overflow: hidden !important;
+}
+
+div[data-testid="stAudioInput"] > div,
+div[data-testid="stAudioInput"] > div:last-child {
+    height: var(--bar-height) !important;
+    min-height: var(--bar-height) !important;
+    max-height: var(--bar-height) !important;
+    width: 100% !important;
+    border-radius: var(--bar-radius) !important;
+    border: var(--bar-border) !important;
+    background-color: var(--bar-bg) !important;
+    box-shadow: var(--bar-shadow) !important;
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 0 12px !important;
+    margin: 0 !important;
+    box-sizing: border-box !important;
+    gap: 6px !important;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease !important;
+    cursor: pointer !important;
+}
+
+div[data-testid="stAudioInput"] > div:hover,
+div[data-testid="stAudioInput"] > div:last-child:hover {
+    border-color: rgba(255, 255, 255, 0.3) !important;
+    background-color: #2c2d38 !important;
+}
+
+/* Hide empty toolbar/menu containers and wavesurfer in compact pill mode */
+div[data-testid="stAudioInput"] [data-testid="stAudioInputWaveSurfer"],
+div[data-testid="stAudioInput"] > div:last-child > div:first-child:not(:has(button[data-testid="stAudioInputActionButton"])),
+div[data-testid="stAudioInput"] > div:last-child > div:empty {
+    display: none !important;
+    width: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    flex: 0 0 0 !important;
+}
+
+div[data-testid="stAudioInput"] button,
+div[data-testid="stAudioInput"] [data-testid="stAudioInputActionButton"] {
+    border: none !important;
+    background: transparent !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    cursor: pointer !important;
+    box-shadow: none !important;
+    min-height: auto !important;
+    height: 24px !important;
+    width: 24px !important;
+    min-width: 24px !important;
+}
+
+div[data-testid="stAudioInput"] button:hover {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    border-radius: 6px !important;
+}
+
+div[data-testid="stAudioInput"] button svg {
+    fill: #f0f2f6 !important;
+    color: #f0f2f6 !important;
+    width: 18px !important;
+    height: 18px !important;
+}
+
+div[data-testid="stAudioInput"] [data-testid="stAudioInputWaveformTimeCode"],
+div[data-testid="stAudioInput"] span {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace !important;
+    font-size: 14px !important;
+    font-weight: 500 !important;
+    color: #e0e0e0 !important;
+    background: transparent !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 24px !important;
+    height: 24px !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    letter-spacing: 0.5px !important;
+    user-select: none !important;
+}
+
+div[data-testid="stAudioInput"] * {
+    color: #e0e0e0 !important;
+}
+
+/* Prevent chat content from being hidden behind fixed bottom bar */
+div[data-testid="stChatMessageContainer"],
+.main .block-container {
+    padding-bottom: 100px !important;
+}
+
+/* Hide iframe created by auto-scroll helper without stopping JS execution */
+iframe[title="streamlit.components.v1.html"] {
+    height: 0 !important;
+    width: 0 !important;
+    opacity: 0 !important;
+    position: absolute !important;
+    pointer-events: none !important;
+    border: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
 }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎓 Opportunity Details RAG Platform")
+st.title("🎓 Opportunity Details AI")
 
-# Sidebar Settings
-st.sidebar.title("Configuration")
-api_url = st.sidebar.text_input("Backend API Base URL", value=DEFAULT_API_URL).rstrip("/")
+# Backend API Base URL and session state initialization
+api_url = st.session_state.get("backend_api_url", DEFAULT_API_URL).rstrip("/")
 
 # Health check & sessions fetch
 backend_online = False
@@ -44,18 +330,84 @@ try:
         health_data = health_resp.json()
         docs_count = health_data.get("docs_count", 0)
         device_type = health_data.get("device", "cpu")
-        st.sidebar.success(f"Backend Connected ({docs_count} docs indexed, {device_type})")
         
         # Fetch sessions from API v1
         sess_resp = requests.get(f"{api_url}/api/v1/sessions", timeout=3)
         if sess_resp.status_code == 200:
             sessions_list = sess_resp.json()
-    else:
-        st.sidebar.warning("Backend returning non-200 status.")
 except Exception:
-    st.sidebar.error("Cannot connect to FastAPI backend. Is it running?")
+    pass
 
-# Sidebar Scraper Trigger Control
+# --- SIDEBAR: 1. CHAT SESSIONS ---
+st.sidebar.title("Chat Sessions")
+
+if "active_session_id" not in st.session_state:
+    if sessions_list:
+        st.session_state.active_session_id = sessions_list[0]["session_id"]
+    else:
+        st.session_state.active_session_id = str(uuid.uuid4())
+
+# Build clean session map
+if sessions_list:
+    session_map = {s["session_id"]: f"{s['title']} ({s['session_id'][:6]})" for s in sessions_list}
+    if st.session_state.active_session_id not in session_map:
+        session_map[st.session_state.active_session_id] = "Current Active Session"
+else:
+    session_map = {
+        st.session_state.active_session_id: "Current Active Session"
+    }
+
+session_keys = list(session_map.keys())
+current_index = session_keys.index(st.session_state.active_session_id) if st.session_state.active_session_id in session_keys else 0
+
+col1, col2 = st.sidebar.columns([4, 1])
+with col1:
+    selected_sid = st.selectbox(
+        "Select Session",
+        options=session_keys,
+        format_func=lambda x: session_map.get(x, x),
+        index=current_index,
+        key="session_select_box",
+        label_visibility="collapsed"
+    )
+    if selected_sid != st.session_state.active_session_id:
+        st.session_state.active_session_id = selected_sid
+        st.rerun()
+
+with col2:
+    if st.button("➕", help="New Chat", use_container_width=True):
+        new_sid = str(uuid.uuid4())
+        if backend_online:
+            try:
+                requests.post(f"{api_url}/api/v1/sessions", json={"title": "New Chat"}, timeout=3)
+            except Exception:
+                pass
+        st.session_state.active_session_id = new_sid
+        st.session_state["session_select_box"] = new_sid
+        st.rerun()
+
+if st.sidebar.button("🗑️ Delete Current Chat", use_container_width=True):
+    if backend_online:
+        try:
+            requests.delete(f"{api_url}/api/v1/sessions/{st.session_state.active_session_id}", timeout=3)
+        except Exception:
+            pass
+    new_sid = str(uuid.uuid4())
+    st.session_state.active_session_id = new_sid
+    st.session_state["session_select_box"] = new_sid
+    st.rerun()
+
+# --- SIDEBAR: 2. MODEL & RAG OPTIONS ---
+st.sidebar.markdown("---")
+st.sidebar.title("Model & RAG Options")
+think = st.sidebar.toggle("Think Mode", value=False)
+rerank = st.sidebar.toggle("Rerank Retrieved Docs", value=True)
+selected_provider = st.sidebar.selectbox("Select Model Provider", options=["Ollama", "LLamaCPP"])
+debug_mode = CLI_DEBUG_FLAG
+if debug_mode:
+    st.sidebar.caption("🐞 *Debug Mode active via CLI flag (`--debug`)*")
+
+# --- SIDEBAR: 3. BACKGROUND SCRAPER ---
 st.sidebar.markdown("---")
 st.sidebar.title("🕸️ Background Scraper")
 
@@ -80,6 +432,19 @@ with col_sc2:
                 st.sidebar.info(f"Status: {s_data.get('status')}\nItems: {s_data.get('items_scraped')}")
         except Exception:
             st.sidebar.warning("Status check failed.")
+
+# --- SIDEBAR: 4. CONFIGURATION ---
+st.sidebar.markdown("---")
+st.sidebar.title("Configuration")
+api_url_input = st.sidebar.text_input("Backend API Base URL", value=api_url, key="backend_api_url").rstrip("/")
+if api_url_input != api_url:
+    st.session_state["backend_api_url"] = api_url_input
+    st.rerun()
+
+if backend_online:
+    st.sidebar.success(f"Backend Connected ({docs_count} docs indexed, {device_type})")
+else:
+    st.sidebar.error("Cannot connect to FastAPI backend. Is it running?")
 
 def clean_pill_text(val: str) -> str:
     """Clean markdown bold/italic tags and extra quotes from pill text, returning empty if placeholder/blank."""
@@ -145,60 +510,8 @@ tab_chat, tab_opps = st.tabs(["💬 Chat Assistant", "🔍 Explore Opportunities
 
 # --- TAB 1: CHAT ASSISTANT ---
 with tab_chat:
-    # Sidebar Session State Management
-    st.sidebar.markdown("---")
-    st.sidebar.title("Chat Sessions")
 
-    if "active_session_id" not in st.session_state:
-        if sessions_list:
-            st.session_state.active_session_id = sessions_list[0]["session_id"]
-        else:
-            st.session_state.active_session_id = str(uuid.uuid4())
 
-    col1, col2 = st.sidebar.columns([3, 1])
-    with col1:
-        if sessions_list:
-            session_map = {s["session_id"]: f"{s['title']} ({s['session_id'][:6]})" for s in sessions_list}
-            if st.session_state.active_session_id not in session_map:
-                session_map[st.session_state.active_session_id] = "Current Active Session"
-            
-            selected_sid = st.selectbox(
-                "Select Session",
-                options=list(session_map.keys()),
-                format_func=lambda x: session_map.get(x, x),
-                index=list(session_map.keys()).index(st.session_state.active_session_id) if st.session_state.active_session_id in session_map else 0,
-                key="session_select_box"
-            )
-            if selected_sid != st.session_state.active_session_id:
-                st.session_state.active_session_id = selected_sid
-                st.rerun()
-
-    with col2:
-        if st.button("➕", help="New Chat"):
-            new_sid = str(uuid.uuid4())
-            try:
-                requests.post(f"{api_url}/api/v1/sessions", json={"title": "New Chat"}, timeout=3)
-            except Exception:
-                pass
-            st.session_state.active_session_id = new_sid
-            st.session_state["session_select_box"] = new_sid
-            st.rerun()
-
-    if st.sidebar.button("🗑️ Delete Current Chat"):
-        try:
-            requests.delete(f"{api_url}/api/v1/sessions/{st.session_state.active_session_id}", timeout=3)
-        except Exception:
-            pass
-        new_sid = str(uuid.uuid4())
-        st.session_state.active_session_id = new_sid
-        st.session_state["session_select_box"] = new_sid
-        st.rerun()
-
-    st.sidebar.title("Model & RAG Options")
-    think = st.sidebar.toggle("Think Mode", value=False)
-    rerank = st.sidebar.toggle("Rerank Retrieved Docs", value=True)
-    debug_mode = st.sidebar.toggle("🐞 Debug Mode", value=False)
-    selected_provider = st.sidebar.selectbox("Select Model Provider", options=["Ollama", "LLamaCPP"])
 
     def render_debug_inspector(meta: dict) -> None:
         """Render interactive debug panel with prompt templates, variables, and retrieved docs."""
@@ -206,7 +519,7 @@ with tab_chat:
             return
 
         dbg = meta.get("debug_info") or {}
-        with st.expander("🐞 Debug Inspector (Prompts, Variables & Retrieval)", expanded=False):
+        with st.expander("🐞 Debug (Prompts, Variables & Retrieval)", expanded=False):
             st.caption(f"**Route Target:** `{dbg.get('route_target', 'N/A')}` | **Opportunity Prompt:** `{meta.get('is_opportunity')}` | **Used Tools:** `{meta.get('used_tools', [])}`")
 
             t1, t2, t3, t4 = st.tabs(["💬 System Prompt", "✉️ Human Prompt", "📄 Retrieved Docs", "📊 Variables & Context"])
@@ -260,16 +573,91 @@ with tab_chat:
                     render_debug_inspector(meta)
                 elif meta.get("is_opportunity"):
                     docs = meta.get("initial_docs", [])
-                    if docs:
-                        with st.expander("Retrieved Document Titles", expanded=False):
-                            for d in docs:
-                                st.markdown(f"- **{d}**")
+                    # if docs:
+                    #     with st.expander("Retrieved Document Titles", expanded=False):
+                    #         for d in docs:
+                    #             st.markdown(f"- **{d}**")
+
+        # Automatically scroll to the bottom/newest message on page load and refresh
+        if messages:
+            st.markdown('<div id="chat-bottom-anchor"></div>', unsafe_allow_html=True)
+            components.html(
+                """
+                <script>
+                    function doScroll() {
+                        try {
+                            const doc = window.parent.document;
+                            const anchor = doc.getElementById('chat-bottom-anchor');
+                            if (anchor) {
+                                anchor.scrollIntoView({ behavior: 'auto', block: 'end' });
+                            } else {
+                                const msgs = doc.querySelectorAll('[data-testid="stChatMessage"]');
+                                if (msgs.length > 0) {
+                                    msgs[msgs.length - 1].scrollIntoView({ behavior: 'auto', block: 'end' });
+                                }
+                            }
+                        } catch (e) {
+                            // ignore cross-origin restrictions if embedded
+                        }
+                    }
+                    doScroll();
+                    setTimeout(doScroll, 50);
+                    setTimeout(doScroll, 150);
+                    setTimeout(doScroll, 350);
+                    setTimeout(doScroll, 700);
+                </script>
+                """,
+                height=0,
+                width=0
+            )
+
+    # Integrated Bottom Chat Input + Permanent Moonshine Voice Recorder (Auto-Sends to LLM)
+    voice_prompt = None
+    if backend_online:
+        rec_key = st.session_state.get("stt_rec_key", 0)
+        audio_file = st.audio_input(
+            "Record voice query",
+            label_visibility="collapsed",
+            key=f"moonshine_voice_recorder_{rec_key}"
+        )
+        if audio_file is not None:
+            audio_bytes = audio_file.getvalue()
+            audio_hash = f"{len(audio_bytes)}_{hash(audio_bytes[:64])}"
+            if st.session_state.get("last_processed_audio_hash") != audio_hash:
+                with st.spinner("🎙️ Transcribing voice with Moonshine STT..."):
+                    try:
+                        files = {"file": ("voice_query.wav", audio_bytes, "audio/wav")}
+                        t_resp = requests.post(f"{api_url}/api/v1/transcribe", files=files, timeout=20)
+                        if t_resp.status_code == 200:
+                            t_data = t_resp.json()
+                            trans_text = t_data.get("text", "").strip()
+                            if trans_text:
+                                st.session_state["last_processed_audio_hash"] = audio_hash
+                                st.session_state["transcribed_query_text"] = trans_text
+                                st.session_state["last_stt_info"] = t_data
+                                # Reset widget key so timer resets back to 00:00 on next cycle
+                                st.session_state["stt_rec_key"] = rec_key + 1
+                                # Auto-send voice query directly to LLM
+                                voice_prompt = trans_text
+                            else:
+                                st.warning("No speech detected in audio. Please speak clearly and try again.")
+                                st.session_state["stt_rec_key"] = rec_key + 1
+                        else:
+                            st.error(f"STT API error ({t_resp.status_code}): {t_resp.text}")
+                    except Exception as e:
+                        st.error(f"Failed to reach STT endpoint: {e}")
 
     # Fixed bottom chat input at root level
-    if prompt := st.chat_input("Ask about scholarships, internships, or opportunities..."):
+    text_prompt = st.chat_input("Ask about scholarships, internships, or opportunities...")
+    prompt = voice_prompt or text_prompt
+
+    if prompt:
         with chat_container:
             with st.chat_message("user"):
-                st.markdown(prompt)
+                if voice_prompt:
+                    st.markdown(f"🎙️ **{prompt}**")
+                else:
+                    st.markdown(prompt)
 
             history_payload = [{"role": m["role"], "content": m["content"], "metadata": m.get("metadata")} for m in messages[-6:]]
 

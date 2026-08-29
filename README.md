@@ -4,6 +4,7 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](pyproject.toml)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.128+-009688.svg)](https://fastapi.tiangolo.com/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.54+-FF4B4B.svg)](https://streamlit.io/)
+[![CI/CD](https://github.com/PraveenRepswal/Opportunities-Details/actions/workflows/ci.yml/badge.svg)](https://github.com/PraveenRepswal/Opportunities-Details/actions/workflows/ci.yml)
 
 A high-performance **Retrieval-Augmented Generation (RAG)** system designed to aggregate and query global scholarship and opportunity data. This project scrapes multiple opportunity portals asynchronously, indexes them using vector and lexical search, and uses a dedicated **FastAPI** backend coupled with local LLMs (**Ollama** / **LlamaCPP**) to answer user queries with high precision and privacy.
 
@@ -13,10 +14,14 @@ A high-performance **Retrieval-Augmented Generation (RAG)** system designed to a
 
 * **Decoupled Microservice Architecture:** Dedicated **FastAPI** backend handling vector search, scraping, and LLM inference, decoupled from visual frontends.
 * **Multi-Client Support:** RESTful API ready for Streamlit, React, Vue, CLI, or mobile clients.
-* **High-Speed Concurrent Scraper:** Asynchronous pipeline using `aiohttp` and `asyncio` fetching data from 6+ opportunity portals simultaneously.
+* **High-Speed Concurrent Scraper:** Asynchronous pipeline using `aiohttp` and `asyncio` fetching data from 6+ opportunity portals simultaneously, with hybrid metadata extraction (rules + local LLM fallback) capturing deadlines, organizations, locations, and types per opportunity.
 * **Hybrid Search & Reranking:** Ensemble retrieval using **FAISS** (vector similarity) + **BM25** (lexical search) with **CrossEncoder** reranking (`ms-marco-MiniLM-L12-v2`).
 * **Local RAG & Privacy First:** Runs completely locally via **Ollama** or **LlamaCPP**, eliminating cloud API costs and keeping data private.
-* **Real-time SSE Token Streaming:** Server-Sent Events (SSE) streaming support for token rendering and reasoning `<think>` block tracking.
+* **Semantic Answer Cache:** SQLite-backed embedding cache (`backend/answer_cache.py`) that returns instant responses for recurring/similar questions, automatically invalidated on re-indexing.
+* **Tiered API Rate Limiting:** Sliding-window rate limiter middleware (`backend/rate_limit.py`) protecting chat, STT, and scraping endpoints against abuse.
+* **Agentic Query Routing:** Lightweight LangGraph-powered router (`backend/agent.py`) that classifies prompts as direct chat vs. RAG/tool usage, with DuckDuckGo web search fallback.
+* **Persistent Chat Sessions:** Multi-session chat history stored in SQLite (`backend/database.py`) with full CRUD via the REST API.
+* **Speech-to-Text:** Voice queries transcribed locally via **Moonshine tiny** (`backend/stt.py`).
 
 ---
 
@@ -35,11 +40,13 @@ A high-performance **Retrieval-Augmented Generation (RAG)** system designed to a
 ## 📋 Prerequisites
 
 1. **Python 3.12+**
-2. **Ollama**: Download and install from [ollama.com](https://ollama.com/).
-3. **Download LLM Model**:
-   ```bash
-   ollama pull qwen3.5:4b
-   ```
+2. **LLM Backend** (choose one):
+   * **LlamaCPP** (default): Download the GGUF model `Qwen3.5-4B-IQ4_NL.gguf` into a `models/` directory and serve it via `llama-server` (default: `http://localhost:8080`).
+   * **Ollama**: Install from [ollama.com](https://ollama.com/) and pull a model:
+     ```bash
+     ollama pull qwen3.5:4b
+     ```
+3. *(Optional)* **Moonshine STT** weights are downloaded automatically on first use of the `/transcribe` endpoint.
 
 ---
 
@@ -108,9 +115,19 @@ docker-compose up --build
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
 | `GET` | `/api/v1/health` | Service health status |
-| `POST` | `/api/v1/query` | RAG search & answer generation (supports streaming) |
+| `POST` | `/api/v1/chat` | RAG chat & answer generation (non-streaming) |
+| `POST` | `/api/v1/chat/stream` | RAG chat with SSE token streaming |
+| `POST` | `/api/v1/transcribe` | Speech-to-text transcription (Moonshine) |
+| `GET` | `/api/v1/opportunities` | List scraped opportunities (paginated) |
+| `GET` | `/api/v1/opportunities/{opp_id}` | Get a single opportunity |
 | `POST` | `/api/v1/scrape` | Trigger asynchronous scraping pipeline |
-| `GET` | `/api/v1/stats` | System, cache, and store metrics |
+| `GET` | `/api/v1/scrape/status` | Status of the last scraping job |
+| `GET` | `/api/v1/sessions` | List chat sessions |
+| `POST` | `/api/v1/sessions` | Create a new chat session |
+| `GET` | `/api/v1/sessions/{session_id}/messages` | Get messages of a session |
+| `DELETE` | `/api/v1/sessions/{session_id}` | Delete a chat session |
+
+> Legacy unversioned aliases (`/chat`, `/chat/stream`, `/sessions`, etc.) are also registered for backwards compatibility.
 
 ---
 
@@ -118,16 +135,26 @@ docker-compose up --build
 
 ```
 Opportunities-Details/
+├── .github/
+│   └── workflows/ci.yml # GitHub Actions CI pipeline (lint + tests)
 ├── backend/
 │   ├── main.py          # FastAPI web server & endpoints
 │   ├── rag.py           # RAG engine, vectorstore, reranker & SSE streaming
+│   ├── agent.py         # Query router (direct chat vs. RAG/tools) & web search fallback
+│   ├── answer_cache.py  # SQLite-backed semantic answer caching engine
+│   ├── database.py      # SQLite persistence for chat sessions & opportunities
+│   ├── metadata_extractor.py # Hybrid metadata extraction (rules + LLM enrichment)
+│   ├── rate_limit.py    # Sliding-window rate limiter middleware
+│   ├── stt.py           # Moonshine speech-to-text transcriber
 │   └── schemas.py       # Pydantic request/response schemas
 ├── scrapers/            # Individual site scrapers (YouthOp, Scholars4Dev, etc.)
 │   ├── base.py          # Base scraper class & Jaccard deduplication
 │   └── ...
+├── tests/               # Pytest suite (answer cache, metadata extractor, rate limiter)
+├── .dockerignore        # Docker build ignore rules
 ├── .env.example         # Environment configuration template
 ├── config.py            # Centralized Pydantic settings & model resolver
-├── docker-compose.yml   # Multi-container Orchestration
+├── docker-compose.yml   # Multi-container orchestration
 ├── Dockerfile           # Multi-stage container build definition
 ├── features.md          # Comprehensive feature list & roadmap
 ├── LICENSE              # MIT Open Source License

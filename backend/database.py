@@ -20,6 +20,28 @@ def get_db_connection():
         conn.close()
 
 
+def _ensure_opportunities_schema(cursor: sqlite3.Cursor) -> None:
+    """Create the opportunities table if missing and migrate metadata columns."""
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS opportunities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            source TEXT,
+            url TEXT,
+            content_hash TEXT UNIQUE,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(opportunities)").fetchall()}
+    if "metadata_json" not in columns:
+        cursor.execute("ALTER TABLE opportunities ADD COLUMN metadata_json TEXT")
+    if "deadline" not in columns:
+        cursor.execute("ALTER TABLE opportunities ADD COLUMN deadline TEXT")
+
+
 def init_db():
     """Initialize SQLite database tables for chat sessions and messages."""
     with get_db_connection() as conn:
@@ -47,19 +69,7 @@ def init_db():
             )
             """
         )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS opportunities (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                content TEXT NOT NULL,
-                source TEXT,
-                url TEXT,
-                content_hash TEXT UNIQUE,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
+        _ensure_opportunities_schema(cursor)
         conn.commit()
     print(f"[DB] Initialized SQLite database at {DB_PATH.resolve()}")
 
@@ -183,18 +193,28 @@ def delete_session(session_id: str):
         conn.commit()
 
 
-def upsert_opportunities(items: List[Dict[str, Any]]) -> int:
-    """Upsert opportunity items into SQLite database based on SHA-256 content hash."""
+def upsert_opportunities(items: List[Dict[str, Any]]) -> List[int]:
+    """Upsert opportunity items into SQLite database based on SHA-256 content hash.
+
+    Items may carry a ``metadata`` dict and ``deadline`` string produced by the
+    metadata extractor. Returns database row IDs aligned with the input order.
+    """
     import hashlib
-    inserted_or_updated = 0
+    row_ids: List[int] = []
     now = datetime.now().isoformat()
     with get_db_connection() as conn:
         cursor = conn.cursor()
+        _ensure_opportunities_schema(cursor)
         for item in items:
             title = item.get("name") or item.get("title") or "Untitled Opportunity"
             content = item.get("content") or ""
             source = item.get("source") or item.get("portal") or ""
             url = item.get("url") or item.get("link") or ""
+            metadata = item.get("metadata")
+            meta_json = json.dumps(metadata) if isinstance(metadata, dict) else None
+            deadline = None
+            if isinstance(metadata, dict):
+                deadline = metadata.get("deadline")
 
             # Compute content hash
             raw_str = f"{title}:{content[:200]}"
@@ -202,20 +222,64 @@ def upsert_opportunities(items: List[Dict[str, Any]]) -> int:
 
             cursor.execute(
                 """
-                INSERT INTO opportunities (title, content, source, url, content_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO opportunities (title, content, source, url, content_hash, created_at, metadata_json, deadline)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(content_hash) DO UPDATE SET
                     title=excluded.title,
                     content=excluded.content,
                     source=excluded.source,
                     url=excluded.url,
-                    created_at=excluded.created_at
+                    created_at=excluded.created_at,
+                    metadata_json=COALESCE(excluded.metadata_json, opportunities.metadata_json),
+                    deadline=COALESCE(excluded.deadline, opportunities.deadline)
                 """,
-                (title, content, source, url, content_hash, now),
+                (title, content, source, url, content_hash, now, meta_json, deadline),
             )
-            inserted_or_updated += 1
+            cursor.execute(
+                "SELECT id FROM opportunities WHERE content_hash = ?",
+                (content_hash,),
+            )
+            row = cursor.fetchone()
+            row_ids.append(row["id"] if row else -1)
         conn.commit()
-    return inserted_or_updated
+    return row_ids
+
+
+def update_opportunity_metadata(opp_id: int, metadata: Dict[str, Any]) -> bool:
+    """Persist enriched metadata for an opportunity row."""
+    if not isinstance(metadata, dict):
+        return False
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        _ensure_opportunities_schema(cursor)
+        cursor.execute(
+            """
+            UPDATE opportunities
+            SET metadata_json = ?, deadline = COALESCE(?, deadline)
+            WHERE id = ?
+            """,
+            (
+                json.dumps(metadata),
+                metadata.get("deadline"),
+                opp_id,
+            ),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def _parse_opportunity_row(row: sqlite3.Row) -> Dict[str, Any]:
+    """Convert a DB row into a dict with parsed metadata."""
+    item = dict(row)
+    meta_json = item.pop("metadata_json", None)
+    if meta_json:
+        try:
+            item["metadata"] = json.loads(meta_json)
+        except Exception:
+            item["metadata"] = None
+    else:
+        item["metadata"] = None
+    return item
 
 
 def list_opportunities(
@@ -227,7 +291,10 @@ def list_opportunities(
     """List opportunities with pagination and optional search filter."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        sql = "SELECT id, title, content, source, url, created_at FROM opportunities WHERE 1=1"
+        sql = (
+            "SELECT id, title, content, source, url, created_at, "
+            "metadata_json, deadline FROM opportunities WHERE 1=1"
+        )
         params: List[Any] = []
 
         if query:
@@ -248,7 +315,7 @@ def list_opportunities(
         params.extend([limit, offset])
 
         cursor.execute(sql, params)
-        rows = [dict(r) for r in cursor.fetchall()]
+        rows = [_parse_opportunity_row(r) for r in cursor.fetchall()]
 
         return {
             "total": total,
@@ -263,9 +330,12 @@ def get_opportunity_by_id(opp_id: int) -> Optional[Dict[str, Any]]:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, title, content, source, url, created_at FROM opportunities WHERE id = ?",
+            (
+                "SELECT id, title, content, source, url, created_at, "
+                "metadata_json, deadline FROM opportunities WHERE id = ?"
+            ),
             (opp_id,),
         )
         row = cursor.fetchone()
-        return dict(row) if row else None
+        return _parse_opportunity_row(row) if row else None
 

@@ -1,5 +1,4 @@
 import re
-import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 import icecream as ic
@@ -8,7 +7,6 @@ import asyncio
 import trafilatura
 import traceback
 import aiohttp
-import json
 
 class GreatYopScraper:
     def __init__(self, index_url, days_back=30, threshold=0.7):

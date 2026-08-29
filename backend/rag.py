@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -7,7 +8,7 @@ import sys
 import unicodedata
 import warnings
 from pathlib import Path
-from typing import AsyncGenerator, Dict, List, Optional, Tuple, Any
+from typing import AsyncGenerator, Dict, List, Optional, Any
 from uuid import uuid4
 
 # Suppress deprecation warnings
@@ -41,38 +42,39 @@ try:
     from langchain_ollama import ChatOllama
 except Exception as e:
     print(f"[RAG] Warning: Core LangChain components import exception ({e}). Using minimal fallbacks.")
-    class Document:
+    class Document:  # type: ignore
         def __init__(self, page_content="", metadata=None):
             self.page_content = page_content
             self.metadata = metadata or {}
-    BM25Retriever = None
-    FAISS = None
-    DistanceStrategy = None
-    StrOutputParser = None
-    ChatPromptTemplate = None
-    HumanMessagePromptTemplate = None
-    SystemMessagePromptTemplate = None
-    EnsembleRetriever = None
-    ChatOllama = None
+    BM25Retriever = Any  # type: ignore
+    FAISS = Any  # type: ignore
+    DistanceStrategy = Any  # type: ignore
+    StrOutputParser = Any  # type: ignore
+    ChatPromptTemplate = Any  # type: ignore
+    HumanMessagePromptTemplate = Any  # type: ignore
+    SystemMessagePromptTemplate = Any  # type: ignore
+    EnsembleRetriever = Any  # type: ignore
+    ChatOllama = Any  # type: ignore
 
 try:
     from langchain_community.chat_models import ChatLlamaCpp
 except Exception as e:
     print(f"[RAG] Warning: ChatLlamaCpp could not be imported ({e}).")
-    ChatLlamaCpp = None
+    ChatLlamaCpp = Any  # type: ignore
 
 try:
     from langchain_huggingface import HuggingFaceEmbeddings
 except Exception as e:
     print(f"[RAG] Warning: HuggingFaceEmbeddings could not be imported ({e}).")
-    HuggingFaceEmbeddings = None
+    HuggingFaceEmbeddings = Any  # type: ignore
 
 try:
     from sentence_transformers import CrossEncoder
 except Exception as e:
     print(f"[RAG] Warning: CrossEncoder could not be imported ({e}).")
-    CrossEncoder = None
+    CrossEncoder = Any  # type: ignore
 
+from backend.answer_cache import SemanticAnswerCache
 from config import settings
 from scraper import CombinedScraper
 
@@ -81,7 +83,7 @@ DAYS_BACK = settings.scraper.days_back
 SCORE_THRESHOLD = settings.scraper.score_threshold
 EMBEDDING_MODEL = settings.model.embedding_model
 CURRENT_DATE_STR = datetime.date.today().strftime("%d/%B/%Y")
-MODEL_PATH = settings.model.main_model
+MODEL_PATH = settings.model.resolved_main_model_path
 
 
 def fetch_opportunity_documents() -> List[Document]:
@@ -144,7 +146,13 @@ def fetch_opportunity_documents() -> List[Document]:
     # 3. Fallback to scraping live
     try:
         scraper = CombinedScraper(days_back=DAYS_BACK, threshold=SCORE_THRESHOLD)
-        raw_data = asyncio.run(scraper.run_all_scrapers())
+
+        async def _run_with_enrichment():
+            data = await scraper.run_all_scrapers()
+            await scraper.await_enrichment()
+            return data
+
+        raw_data = asyncio.run(_run_with_enrichment())
         if isinstance(raw_data, list):
             for item in raw_data:
                 if isinstance(item, dict):
@@ -283,6 +291,15 @@ class RAGPipeline:
         self.reranker: Optional[CrossEncoder] = None
         self.embeddings: Optional[HuggingFaceEmbeddings] = None
         self.is_initialized: bool = False
+        # Semantic answer cache: lives in the same SQLite file/volume as the app DB.
+        from backend.database import DB_PATH
+
+        self.answer_cache = SemanticAnswerCache(
+            db_path=DB_PATH,
+            threshold=settings.model.semantic_cache_similarity_threshold,
+            ttl_hours=settings.model.semantic_cache_ttl_hours,
+            max_entries=settings.model.semantic_cache_max_entries,
+        )
 
     def _build_parent_docstore(self):
         """Build in-memory docstore mapping parent_id to full Parent Document."""
@@ -371,6 +388,11 @@ class RAGPipeline:
     def reload_documents(self):
         """Re-fetch documents, rebuild child chunks, and update FAISS index on disk."""
         print("[RAG] Reloading documents and updating persistent vectorstore...")
+        try:
+            self.answer_cache.bump_epoch()
+            print(f"[RAG] Answer cache invalidated (epoch -> {self.answer_cache.epoch}).")
+        except Exception as err:
+            print(f"[RAG] Answer-cache epoch bump failed: {err}")
         self.docs = fetch_opportunity_documents()
         self._build_parent_docstore()
         child_docs = create_child_chunks(self.docs, chunk_size=500, chunk_overlap=80)
@@ -431,11 +453,11 @@ class RAGPipeline:
             if use_external_server:
                 print(f"[RAG] Connecting to external llama.cpp server at {llama_url}")
                 try:
-                    from langchain_community.chat_models import ChatOpenAI
+                    from langchain_openai import ChatOpenAI
                     return ChatOpenAI(
-                        openai_api_base=f"{llama_url.rstrip('/')}/v1",
-                        openai_api_key="not-needed",
-                        model_name="qwen3.5:4b",
+                        base_url=f"{llama_url.rstrip('/')}/v1",
+                        api_key="not-needed",
+                        model="qwen3.5:4b",
                         temperature=0.0,
                         streaming=True,
                     )
@@ -454,7 +476,7 @@ class RAGPipeline:
     async def stream_response(
         self,
         prompt: str,
-        history: List[Dict[str, str]],
+        history: List[Dict[str, Any]],
         provider: str = "Ollama",
         think: bool = False,
         rerank: bool = True,
@@ -465,6 +487,47 @@ class RAGPipeline:
         """Stream response tokens for a given prompt and conversation history."""
         if not self.is_initialized:
             self.initialize()
+
+        # --- Semantic answer cache (single-turn requests only) ---
+        # Multi-turn answers depend on conversation context; debug bypasses so the
+        # live pipeline stays inspectable.
+        config_hash = hashlib.sha1(
+            "|".join(
+                [
+                    provider,
+                    str(think),
+                    str(rerank),
+                    ollama_base_url or settings.model.ollama_base_url,
+                    llamacpp_server_url or settings.model.llamacpp_server_url,
+                ]
+            ).encode("utf-8")
+        ).hexdigest()
+
+        cacheable = (
+            settings.model.semantic_cache_enabled
+            and not history
+            and not debug
+            and self.embeddings is not None
+        )
+        query_vec: Optional[List[float]] = None
+        if cacheable:
+            try:
+                query_vec = self.embeddings.embed_query(prompt)
+            except Exception as exc:
+                print(f"[RAG] Semantic-cache embed failed ({exc}); bypassing cache.")
+                cacheable = False
+
+        if cacheable:
+            cached = self.answer_cache.lookup(prompt, query_vec, config_hash)
+            if cached is not None:
+                print(f"[RAG] Answer-cache HIT (similarity={cached['similarity']:.3f}).")
+                cached_meta = dict(cached.get("metadata") or {})
+                cached_meta["cache_hit"] = True
+                yield f"[[METADATA]]{json.dumps(cached_meta)}\n"
+                answer_text = cached["answer"]
+                for i in range(0, len(answer_text), 32):
+                    yield answer_text[i : i + 32]
+                return
 
         if self.vectorstore is not None and self.bm25_retriever is not None:
             dense_retriever = self.vectorstore.as_retriever(
@@ -617,6 +680,15 @@ class RAGPipeline:
 
         yield f"[[METADATA]]{json.dumps(meta_info)}\n"
 
+        generated_chunks: List[str] = []
         for chunk in chain.stream(input_data):
             chunk_str = chunk if isinstance(chunk, str) else getattr(chunk, "content", str(chunk))
+            generated_chunks.append(chunk_str)
             yield chunk_str
+
+        if cacheable and generated_chunks:
+            try:
+                self.answer_cache.store(prompt, query_vec, config_hash, "".join(generated_chunks), meta_info)
+                print("[RAG] Answer-cache MISS -> response stored for future reuse.")
+            except Exception as exc:
+                print(f"[RAG] Answer-cache store failed: {exc}")

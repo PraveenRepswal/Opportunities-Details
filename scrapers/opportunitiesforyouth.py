@@ -1,10 +1,7 @@
-import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 import re
 from slugify import slugify
-import icecream as ic
-import json
 import aiohttp
 import asyncio
 import trafilatura

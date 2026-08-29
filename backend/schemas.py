@@ -58,6 +58,9 @@ class HealthResponse(BaseModel):
     days_back: int = 30
     ollama_base_url: str = ""
     llamacpp_server_url: str = ""
+    cache_hits: int = 0
+    cache_misses: int = 0
+    cache_entries: int = 0
 
 class OpportunityItem(BaseModel):
     id: int
@@ -66,6 +69,8 @@ class OpportunityItem(BaseModel):
     source: Optional[str] = None
     url: Optional[str] = None
     created_at: str
+    deadline: Optional[str] = Field(None, description="Application deadline in ISO format (YYYY-MM-DD)")
+    metadata: Optional[dict] = Field(None, description="Extracted metadata: organization, location, type, deadline")
 
 class OpportunitiesResponse(BaseModel):
     total: int
@@ -83,4 +88,13 @@ class ScrapeResponse(BaseModel):
     message: str
     items_scraped: Optional[int] = 0
     scraped_at: str
+
+class TranscribeResponse(BaseModel):
+    text: str
+    success: bool = True
+    device_used: str = "cpu"
+    duration_seconds: float = 0.0
+    inference_time_seconds: Optional[float] = 0.0
+    error: Optional[str] = None
+
 

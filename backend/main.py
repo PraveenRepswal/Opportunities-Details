@@ -1,11 +1,10 @@
-import asyncio
 import json
 import sys
 from datetime import datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, APIRouter, BackgroundTasks, Query
+from fastapi import FastAPI, HTTPException, APIRouter, BackgroundTasks, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import uvicorn
@@ -24,7 +23,10 @@ from backend.schemas import (
     OpportunitiesResponse,
     ScrapeRequest,
     ScrapeResponse,
+    TranscribeResponse,
 )
+from backend.stt import get_transcriber
+from backend.rate_limit import RateLimitMiddleware
 from backend.rag import RAGPipeline, DEVICE, DAYS_BACK, strip_thinking_tags
 from backend.database import (
     init_db,
@@ -35,7 +37,6 @@ from backend.database import (
     delete_session,
     list_opportunities,
     get_opportunity_by_id,
-    upsert_opportunities,
 )
 from scraper import CombinedScraper
 from config import settings
@@ -71,6 +72,22 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Per-client-IP rate limiting, tiered by endpoint cost (chat/transcribe/scrape
+# are expensive; reads are cheap). Health & docs endpoints are exempt.
+# NOTE: must be added BEFORE CORSMiddleware so 429 responses still get CORS
+# headers (the last-added middleware runs outermost).
+if settings.api.rate_limit_enabled:
+    app.add_middleware(
+        RateLimitMiddleware,
+        limits={
+            "chat": settings.api.rate_limit_chat_per_minute,
+            "transcribe": settings.api.rate_limit_transcribe_per_minute,
+            "scrape": settings.api.rate_limit_scrape_per_minute,
+            "default": settings.api.rate_limit_default_per_minute,
+        },
+        trust_forwarded_for=settings.api.rate_limit_trust_proxy,
+    )
+
 # Enable CORS for all clients (mobile, web frontends, Streamlit, etc.)
 app.add_middleware(
     CORSMiddleware,
@@ -94,10 +111,7 @@ async def _execute_scrape_job(days_back: int, threshold: float, reindex: bool):
     try:
         scraper = CombinedScraper(days_back=days_back, threshold=threshold)
         results = await scraper.run_all_scrapers()
-
-        saved_count = 0
-        if isinstance(results, list):
-            saved_count = upsert_opportunities(results)
+        await scraper.await_enrichment()
 
         if reindex:
             rag_pipeline.reload_documents()
@@ -118,6 +132,13 @@ async def _execute_scrape_job(days_back: int, threshold: float, reindex: bool):
 @app.get("/health", response_model=HealthResponse, include_in_schema=False)
 async def health_check():
     """Health check endpoint returning system status and RAG metrics."""
+    cache_stats = {"hits": 0, "misses": 0, "entries": 0}
+    if hasattr(rag_pipeline, "answer_cache"):
+        try:
+            cache_stats = rag_pipeline.answer_cache.stats()
+        except Exception:
+            pass
+
     return HealthResponse(
         status="ok" if rag_pipeline.is_initialized else "initializing",
         docs_count=len(rag_pipeline.docs) if rag_pipeline.docs else 0,
@@ -125,6 +146,9 @@ async def health_check():
         days_back=DAYS_BACK,
         ollama_base_url=settings.model.ollama_base_url,
         llamacpp_server_url=settings.model.llamacpp_server_url,
+        cache_hits=cache_stats["hits"],
+        cache_misses=cache_stats["misses"],
+        cache_entries=cache_stats["entries"],
     )
 
 
@@ -211,13 +235,14 @@ async def chat_stream(request: ChatRequest):
             add_message(session_id=session_id, role="user", content=request.prompt)
 
         history = [m.model_dump() for m in request.conversation_history]
+        effective_debug = request.debug or settings.debug
         raw_generator = rag_pipeline.stream_response(
             prompt=request.prompt,
             history=history,
             provider=request.provider,
             think=request.think,
             rerank=request.rerank,
-            debug=request.debug,
+            debug=effective_debug,
             ollama_base_url=request.ollama_base_url,
             llamacpp_server_url=request.llamacpp_server_url,
         )
@@ -369,14 +394,48 @@ async def delete_chat_session(session_id: str):
     return {"status": "deleted", "session_id": session_id}
 
 
+# --- SPEECH-TO-TEXT (STT) VOICE ENDPOINTS ---
+@router_v1.post("/transcribe", response_model=TranscribeResponse)
+@app.post("/transcribe", response_model=TranscribeResponse, include_in_schema=False)
+@app.post("/api/transcribe", response_model=TranscribeResponse, include_in_schema=False)
+async def transcribe_audio(file: UploadFile = File(...)):
+    """Transcribe microphone audio stream or uploaded audio file using Moonshine STT."""
+    try:
+        audio_bytes = await file.read()
+        transcriber = get_transcriber()
+        result = transcriber.transcribe(audio_bytes)
+        return TranscribeResponse(**result)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Speech transcription failed: {str(exc)}",
+        )
+
+
 # Mount router
 app.include_router(router_v1)
 
 
 if __name__ == "__main__":
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(description="Opportunity Chatbot FastAPI Backend")
+    parser.add_argument("--host", default=settings.api.host, help="Host to bind server")
+    parser.add_argument("--port", type=int, default=settings.api.port, help="Port to bind server")
+    parser.add_argument("--debug", action="store_true", default=settings.debug, help="Enable debug mode for prompt and retrieval inspection")
+    parser.add_argument("--no-reload", action="store_false", dest="reload", default=True, help="Disable auto-reload")
+    args = parser.parse_args()
+
+    if args.debug:
+        os.environ["DEBUG"] = "true"
+        settings.debug = True
+        print("[API] 🐞 Debug mode ENABLED via CLI flag --debug")
+
     uvicorn.run(
         "backend.main:app",
-        host=settings.api.host,
-        port=settings.api.port,
-        reload=True,
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
     )
+

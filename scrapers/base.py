@@ -134,7 +134,7 @@ class BaseScraper:
         Returns list of normalized item dicts.
         """
         logger.info("%s: starting getting_data", self.name)
-        session = await self._ensure_session()
+        await self._ensure_session()
         try:
             index_content = await self.fetch_index()
             urls = list(await self.parse_index(index_content))

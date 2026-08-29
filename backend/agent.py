@@ -1,12 +1,11 @@
 import re
-import json
 from enum import Enum
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 
 # Try importing langgraph or define a lightweight state graph fallback
 try:
-    from langgraph.graph import StateGraph, END
+    from langgraph.graph import StateGraph, END  # noqa: F401 -- StateGraph import doubles as availability probe
     LANGGRAPH_AVAILABLE = True
 except ImportError:
     LANGGRAPH_AVAILABLE = False
@@ -102,7 +101,7 @@ def search_live_web(query: str, max_results: int = 5) -> str:
 
 class OpportunityAgentState(BaseModel):
     prompt: str
-    history: List[Dict[str, str]] = Field(default_factory=list)
+    history: List[Dict[str, Any]] = Field(default_factory=list)
     retrieved_docs: List[Any] = Field(default_factory=list)
     context_text: str = ""
     used_tools: List[str] = Field(default_factory=list)
@@ -156,7 +155,7 @@ class OpportunityAgentGraph:
     async def run_agent_workflow(
         self,
         prompt: str,
-        history: List[Dict[str, str]] = None,
+        history: Optional[List[Dict[str, Any]]] = None,
         provider: str = "Ollama",
         think: bool = False,
         ollama_base_url: Optional[str] = None,
