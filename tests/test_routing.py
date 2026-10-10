@@ -184,6 +184,37 @@ class TestNeedleRouting:
 
 
 class TestDeepDiveResolution:
+    @pytest.fixture(autouse=True)
+    def setup_test_db(self, tmp_path, monkeypatch):
+        test_db = tmp_path / "test_routing_deep_dive.db"
+        monkeypatch.setattr("backend.database.DB_PATH", test_db)
+        from backend.database import init_db, upsert_opportunities
+
+        init_db()
+        sample_opps = [
+            {
+                "title": "Max Planck MTL Internship in Germany",
+                "content": (
+                    "Max Planck MTL Internship program in Germany offers comprehensive research opportunities "
+                    "for international students. " * 30
+                ),
+                "url": "https://example.com/max-planck-mtl",
+                "metadata": {"deadline": "2026-11-30"},
+                "source": "greatyop",
+            },
+            {
+                "title": "World Bank Fellowship Program",
+                "content": (
+                    "The World Bank Fellowship Program provides funding, mentoring, and research support for "
+                    "young professionals globally. " * 30
+                ),
+                "url": "https://example.com/world-bank-fellowship",
+                "metadata": {"deadline": "2026-12-31"},
+                "source": "scholars4dev",
+            },
+        ]
+        upsert_opportunities(sample_opps)
+
     def test_resolve_opportunity_deep_dive(self):
         from backend.agent import format_deep_dive_dossier, resolve_opportunity_deep_dive
         opp = resolve_opportunity_deep_dive("Max Planck MTL")
