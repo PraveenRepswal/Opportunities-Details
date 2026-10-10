@@ -42,6 +42,8 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv pip install --system pytest -r requirements.txt
+        run: |
+          uv pip install --system --extra-index-url https://download.pytorch.org/whl/cpu "torch>=2.2.0"
+          uv pip install --system pytest -r requirements.txt
 
       - run: python -m pytest tests/ -v

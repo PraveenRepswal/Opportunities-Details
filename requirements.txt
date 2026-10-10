@@ -595,7 +595,7 @@ toml==0.10.2
     # via
     #   opportunities-details
     #   streamlit
-torch==2.14.0+cu130
+torch>=2.2.0
     # via
     #   opportunities-details
     #   sentence-transformers
