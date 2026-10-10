@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import datetime
 import hashlib
@@ -5,11 +7,66 @@ import json
 import os
 import re
 import sys
-import unicodedata
 import warnings
 from pathlib import Path
-from typing import AsyncGenerator, Dict, List, Optional, Any
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from langchain_community.chat_models import ChatLlamaCpp
+    from langchain_community.retrievers import BM25Retriever
+    from langchain_community.vectorstores import FAISS
+    from langchain_community.vectorstores.utils import DistanceStrategy
+    from langchain_core.documents import Document
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate
+    from langchain_classic.retrievers import EnsembleRetriever
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_ollama import ChatOllama
+    from sentence_transformers import CrossEncoder
+else:
+    try:
+        from langchain_community.retrievers import BM25Retriever
+        from langchain_community.vectorstores import FAISS
+        from langchain_community.vectorstores.utils import DistanceStrategy
+        from langchain_core.documents import Document
+        from langchain_core.output_parsers import StrOutputParser
+        from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate
+        from langchain_classic.retrievers import EnsembleRetriever
+        from langchain_ollama import ChatOllama
+    except Exception as e:
+        print(f"[RAG] Warning: Core LangChain components import exception ({e}). Using minimal fallbacks.")
+        class Document:
+            def __init__(self, page_content="", metadata=None):
+                self.page_content = page_content
+                self.metadata = metadata or {}
+        BM25Retriever = None
+        FAISS = None
+        DistanceStrategy = None
+        StrOutputParser = None
+        ChatPromptTemplate = None
+        HumanMessagePromptTemplate = None
+        SystemMessagePromptTemplate = None
+        EnsembleRetriever = None
+        ChatOllama = None
+
+    try:
+        from langchain_community.chat_models import ChatLlamaCpp
+    except Exception as e:
+        print(f"[RAG] Warning: ChatLlamaCpp could not be imported ({e}).")
+        ChatLlamaCpp = None
+
+    try:
+        from langchain_huggingface import HuggingFaceEmbeddings
+    except Exception as e:
+        print(f"[RAG] Warning: HuggingFaceEmbeddings could not be imported ({e}).")
+        HuggingFaceEmbeddings = None
+
+    try:
+        from sentence_transformers import CrossEncoder
+    except Exception as e:
+        print(f"[RAG] Warning: CrossEncoder could not be imported ({e}).")
+        CrossEncoder = None
 
 # Suppress deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*langchain-community.*")
@@ -31,50 +88,8 @@ except Exception as torch_err:
     torch = None
     DEVICE = "cpu"
 
-try:
-    from langchain_community.retrievers import BM25Retriever
-    from langchain_community.vectorstores import FAISS
-    from langchain_community.vectorstores.utils import DistanceStrategy
-    from langchain_core.documents import Document
-    from langchain_core.output_parsers import StrOutputParser
-    from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate
-    from langchain_classic.retrievers import EnsembleRetriever
-    from langchain_ollama import ChatOllama
-except Exception as e:
-    print(f"[RAG] Warning: Core LangChain components import exception ({e}). Using minimal fallbacks.")
-    class Document:  # type: ignore
-        def __init__(self, page_content="", metadata=None):
-            self.page_content = page_content
-            self.metadata = metadata or {}
-    BM25Retriever = Any  # type: ignore
-    FAISS = Any  # type: ignore
-    DistanceStrategy = Any  # type: ignore
-    StrOutputParser = Any  # type: ignore
-    ChatPromptTemplate = Any  # type: ignore
-    HumanMessagePromptTemplate = Any  # type: ignore
-    SystemMessagePromptTemplate = Any  # type: ignore
-    EnsembleRetriever = Any  # type: ignore
-    ChatOllama = Any  # type: ignore
-
-try:
-    from langchain_community.chat_models import ChatLlamaCpp
-except Exception as e:
-    print(f"[RAG] Warning: ChatLlamaCpp could not be imported ({e}).")
-    ChatLlamaCpp = Any  # type: ignore
-
-try:
-    from langchain_huggingface import HuggingFaceEmbeddings
-except Exception as e:
-    print(f"[RAG] Warning: HuggingFaceEmbeddings could not be imported ({e}).")
-    HuggingFaceEmbeddings = Any  # type: ignore
-
-try:
-    from sentence_transformers import CrossEncoder
-except Exception as e:
-    print(f"[RAG] Warning: CrossEncoder could not be imported ({e}).")
-    CrossEncoder = Any  # type: ignore
-
 from backend.answer_cache import SemanticAnswerCache
+from backend.text_utils import clean_opportunity_text, fix_mojibake, normalize_text  # noqa: F401 (re-exported)
 from config import settings
 from scraper import CombinedScraper
 
@@ -86,64 +101,71 @@ CURRENT_DATE_STR = datetime.date.today().strftime("%d/%B/%Y")
 MODEL_PATH = settings.model.resolved_main_model_path
 
 
-def fetch_opportunity_documents() -> List[Document]:
-    """Fetch opportunities from SQLite database, scraped_data.txt, or CombinedScraper."""
-    docs: List[Document] = []
-    ignored_titles = {"about us", "our services", "contact us", "privacy policy", "terms of service", "our team"}
+IGNORED_TITLES = {"about us", "our services", "contact us", "privacy policy", "terms of service", "our team"}
 
+
+def _item_to_document(item: Dict[str, Any], doc_id: Optional[str] = None) -> Document:
+    """Build a parent Document from a DB row or a scraped item (same shape either way)."""
+    from backend.schemas import OpportunityProfile
+    from backend.metadata_extractor import format_profile_for_vectorstore
+
+    title = item.get("name") or item.get("title") or ""
+    url = item.get("url") or item.get("link") or ""
+    meta_dict = item.get("metadata") or {}
+    prof_dict = item.get("profile") or {}
+
+    doc_meta = {
+        "name": title,
+        "id": doc_id or str(item.get("id") or uuid4()),
+        "url": url,
+        "source": item.get("source") or item.get("portal") or "",
+        "deadline": item.get("deadline") or prof_dict.get("deadline") or meta_dict.get("deadline"),
+        "organization": prof_dict.get("organization") or meta_dict.get("organization"),
+        "location": prof_dict.get("location") or meta_dict.get("location"),
+        "type": prof_dict.get("type") or meta_dict.get("type"),
+        "eligibility": prof_dict.get("eligibility"),
+        "benefits": prof_dict.get("benefits"),
+        "summary": prof_dict.get("summary"),
+    }
+
+    page_text = fix_mojibake(item.get("content") or "")
+    if prof_dict.get("summary"):
+        try:
+            page_text = format_profile_for_vectorstore(OpportunityProfile(**prof_dict), url=url)
+        except Exception:
+            pass
+    return Document(page_content=page_text, metadata=doc_meta)
+
+
+def _documents_from_items(items: List[Dict[str, Any]]) -> List[Document]:
+    docs: List[Document] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = (item.get("name") or item.get("title") or "").strip().lower()
+        if title in IGNORED_TITLES:
+            continue
+        docs.append(_item_to_document(item))
+    return docs
+
+
+def fetch_opportunity_documents() -> List[Document]:
+    """Fetch opportunities from SQLite database or CombinedScraper."""
     # 1. Try fetching from SQLite database first
     try:
-        from backend.database import list_opportunities, upsert_opportunities
-        db_res = list_opportunities(limit=1000)
-        items = db_res.get("items", [])
-        if items:
-            for item in items:
-                title = item.get("title", "")
-                if title and title.strip().lower() in ignored_titles:
-                    continue
-                docs.append(
-                    Document(
-                        page_content=unicodedata.normalize("NFKC", item.get("content", "")),
-                        metadata={"name": title, "id": str(item.get("id", uuid4())), "url": item.get("url", "")},
-                    )
-                )
-            if docs:
-                print(f"[RAG] Loaded {len(docs)} documents from SQLite opportunities table.")
-                return docs
+        from backend.database import list_opportunities
+        items = list_opportunities(limit=1000, include_curated=False).get("items", [])
+        docs = _documents_from_items(items)
+        if docs:
+            print(f"[RAG] Loaded {len(docs)} documents from SQLite opportunities table.")
+            return docs
     except Exception as exc:
         print(f"[RAG] DB fetch error: {exc}")
 
-    # 2. Try loading from scraped_data.txt file
-    try:
-        data_file = Path("scraped_data.txt")
-        if data_file.is_file():
-            with open(data_file, "r", encoding="utf-8") as f:
-                raw_data = json.load(f)
-            if isinstance(raw_data, list) and raw_data:
-                # Store in SQLite for future queries
-                try:
-                    upsert_opportunities(raw_data)
-                except Exception:
-                    pass
+    docs: List[Document] = []
+    ignored_titles = IGNORED_TITLES
 
-                for item in raw_data:
-                    if isinstance(item, dict):
-                        name = item.get("name") or item.get("title") or ""
-                        if name and name.strip().lower() in ignored_titles:
-                            continue
-                        docs.append(
-                            Document(
-                                page_content=unicodedata.normalize("NFKC", item.get("content", "")),
-                                metadata={"name": name, "id": str(uuid4())},
-                            )
-                        )
-                if docs:
-                    print(f"[RAG] Loaded {len(docs)} documents from scraped_data.txt.")
-                    return docs
-    except Exception as exc:
-        print(f"[RAG] File fetch error: {exc}")
-
-    # 3. Fallback to scraping live
+    # 2. Fallback to scraping live
     try:
         scraper = CombinedScraper(days_back=DAYS_BACK, threshold=SCORE_THRESHOLD)
 
@@ -161,7 +183,7 @@ def fetch_opportunity_documents() -> List[Document]:
                         continue
                     docs.append(
                         Document(
-                            page_content=unicodedata.normalize("NFKC", item.get("content", "")),
+                            page_content=fix_mojibake(item.get("content", "")),
                             metadata={"name": name, "id": str(uuid4())},
                         )
                     )
@@ -181,7 +203,7 @@ def fetch_opportunity_documents() -> List[Document]:
     return docs
 
 
-def rerank_docs(query: str, docs: List[Document], reranker: CrossEncoder, top_k: int = 5) -> List[Document]:
+def rerank_docs(query: str, docs: List[Document], reranker: CrossEncoder, top_k: int = 3) -> List[Document]:
     """Rerank retrieved document candidates using CrossEncoder."""
     if not docs:
         return []
@@ -192,20 +214,76 @@ def rerank_docs(query: str, docs: List[Document], reranker: CrossEncoder, top_k:
     return [doc for doc, _ in scored_docs[:top_k]]
 
 
-def format_context_snippets(docs: List[Document], max_chars: int = 3500) -> str:
-    """Format document content into concise context text preserving full details and deadlines."""
+def format_context_snippets(
+    docs: List[Document],
+    max_total_chars: int = 4000,
+    max_chars_per_doc: int = 1400,
+    max_chars: Optional[int] = None,
+) -> str:
+    """Format document content into a bounded, high-signal context budget (max ~1,000 tokens total)."""
+    if max_chars is not None:
+        max_total_chars = max_chars
+
     seen_titles = set()
     chunks = []
-    for doc in docs:
-        title = (doc.metadata or {}).get("name", "Unknown").strip() or "Unknown"
+    total_chars = 0
+
+    for idx, doc in enumerate(docs, 1):
+        meta = doc.metadata or {}
+        title = meta.get("name") or meta.get("title") or "Unknown Opportunity"
+        title = title.strip()
         if title in seen_titles:
             continue
-        snippet = (doc.page_content or "").strip()
-        if not snippet:
+
+        raw = (doc.page_content or "").strip()
+        if not raw:
             continue
-        normalized = " ".join(snippet.split())
-        chunks.append(f"Title: {title}\nContent: {normalized[:max_chars]}")
+
+        cleaned = clean_opportunity_text(raw)
+        if not cleaned:
+            continue
+
+        # Extract structured metadata fields pinned at the top
+        meta_parts = []
+        dl = meta.get("deadline")
+        org = meta.get("organization")
+        loc = meta.get("location")
+        tp = meta.get("type")
+        url = meta.get("url")
+
+        if dl:
+            meta_parts.append(f"Deadline: {dl}")
+        if org:
+            meta_parts.append(f"Organization: {org}")
+        if loc:
+            meta_parts.append(f"Location: {loc}")
+        if tp:
+            meta_parts.append(f"Type: {tp}")
+
+        meta_line = " | ".join(meta_parts) if meta_parts else "Not explicitly specified"
+        url_line = f"\nLink: {url}" if url else ""
+        header = f"[{idx}] {title}\nMetadata: {meta_line}{url_line}\nDescription: "
+
+        # Remaining budget for this entire entry (header + description + delimiter)
+        delimiter_len = 2 if chunks else 0
+        available_for_entry = max_total_chars - total_chars - delimiter_len
+        available_for_snippet = available_for_entry - len(header)
+
+        if available_for_snippet <= 150:
+            # Not enough budget remaining for a useful description
+            break
+
+        doc_limit = min(max_chars_per_doc, available_for_snippet)
+        if len(cleaned) > doc_limit:
+            snippet = cleaned[:doc_limit].rsplit(" ", 1)[0] + "..."
+        else:
+            snippet = cleaned
+
+        entry = f"{header}{snippet}"
+        chunks.append(entry)
+        total_chars += len(entry) + delimiter_len
         seen_titles.add(title)
+
     return "\n\n".join(chunks)
 
 
@@ -223,14 +301,6 @@ def compress_history_for_opportunities(history: List[Dict[str, Any]], max_items:
         if role == "user":
             history_lines.append(f"User: {content}")
         else:
-            meta = m.get("metadata") or {}
-            cards = meta.get("opportunity_cards") or []
-            if cards:
-                titles = [c.get("title", "") for c in cards if isinstance(c, dict) and c.get("title")]
-                if titles:
-                    history_lines.append(f"Assistant: Provided details for [{', '.join(titles)}]")
-                    continue
-
             extracted_titles = []
             for line in content.split("\n"):
                 line_clean = line.strip()
@@ -249,10 +319,13 @@ def compress_history_for_opportunities(history: List[Dict[str, Any]], max_items:
 
 
 def strip_thinking_tags(text: str) -> str:
-    """Strip out <think>...</think> XML blocks from response."""
+    """Strip out <think>...</think> XML blocks and [[THINK]] markers from response."""
     if "</think>" in text and "<think>" not in text:
         text = text.split("</think>")[-1]
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    if "<think>" in cleaned:
+        cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"\[\[THINK\]\].*?(?:\n|$)", "", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
@@ -288,6 +361,7 @@ class RAGPipeline:
         self.parent_docstore: Dict[str, Document] = {}
         self.vectorstore: Optional[FAISS] = None
         self.bm25_retriever: Optional[BM25Retriever] = None
+        self.ensemble_retriever: Optional[Any] = None
         self.reranker: Optional[CrossEncoder] = None
         self.embeddings: Optional[HuggingFaceEmbeddings] = None
         self.is_initialized: bool = False
@@ -326,6 +400,59 @@ class RAGPipeline:
                     seen_ids.add(name)
         return parent_docs
 
+    def _compute_corpus_fingerprint(self, child_docs: List[Document]) -> str:
+        """Deterministic hash of parent documents and child chunks to detect corpus changes."""
+        hasher = hashlib.sha256()
+        hasher.update(f"{len(self.docs)}:{len(child_docs)}:".encode("utf-8"))
+        for d in self.docs:
+            m = d.metadata or {}
+            doc_id = str(m.get("id", ""))
+            doc_name = str(m.get("name", ""))
+            hasher.update(f"{doc_id}:{doc_name}|".encode("utf-8"))
+        return hasher.hexdigest()
+
+    def _build_and_save_vectorstore(self, child_docs: List[Document]) -> None:
+        """Build FAISS vectorstore from child documents and persist index + manifest to disk."""
+        if not self.embeddings or not child_docs or FAISS is None:
+            return
+        self.vectorstore = FAISS.from_documents(
+            child_docs,
+            self.embeddings,
+            distance_strategy=DistanceStrategy.COSINE,
+        )
+        FAISS_STORE_DIR.mkdir(parents=True, exist_ok=True)
+        self.vectorstore.save_local(str(FAISS_STORE_DIR))
+
+        manifest = {
+            "doc_count": len(self.docs),
+            "chunk_count": len(child_docs),
+            "fingerprint": self._compute_corpus_fingerprint(child_docs),
+            "embedding_model": EMBEDDING_MODEL,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        manifest_path = FAISS_STORE_DIR / "manifest.json"
+        try:
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            print(f"[RAG] Saved FAISS index and manifest with {len(child_docs)} chunks to {FAISS_STORE_DIR}/")
+        except Exception as e:
+            print(f"[RAG] Warning: Failed to write FAISS manifest ({e})")
+
+    def _build_ensemble_retriever(self) -> Optional[Any]:
+        """Construct the hybrid BM25 + FAISS Dense EnsembleRetriever once."""
+        if self.vectorstore is not None and self.bm25_retriever is not None and EnsembleRetriever is not None:
+            dense_retriever = self.vectorstore.as_retriever(
+                search_type="mmr",
+                search_kwargs={"k": 3, "fetch_k": 10, "lambda_mult": 0.5},
+            )
+            self.ensemble_retriever = EnsembleRetriever(
+                retrievers=[self.bm25_retriever, dense_retriever],
+                weights=[0.4, 0.6],
+            )
+        else:
+            self.ensemble_retriever = self.bm25_retriever
+        return self.ensemble_retriever
+
     def initialize(self):
         """Warm up scrapers, embeddings, persistent FAISS vectorstore, and reranker."""
         print(f"[RAG] Initializing pipeline on device: {DEVICE}")
@@ -343,38 +470,44 @@ class RAGPipeline:
                     model_kwargs={"device": DEVICE},
                     encode_kwargs={"normalize_embeddings": True},
                 )
-                if FAISS_STORE_DIR.exists() and (FAISS_STORE_DIR / "index.faiss").is_file():
+                index_path = FAISS_STORE_DIR / "index.faiss"
+                manifest_path = FAISS_STORE_DIR / "manifest.json"
+                is_index_valid = False
+
+                if index_path.is_file() and manifest_path.is_file():
+                    try:
+                        with open(manifest_path, "r", encoding="utf-8") as f:
+                            manifest = json.load(f)
+                        expected_fp = self._compute_corpus_fingerprint(child_docs)
+                        if (
+                            manifest.get("fingerprint") == expected_fp
+                            and manifest.get("embedding_model") == EMBEDDING_MODEL
+                        ):
+                            is_index_valid = True
+                        else:
+                            print("[RAG] Persisted FAISS index is stale (corpus changed). Rebuilding...")
+                    except Exception as e:
+                        print(f"[RAG] Error reading FAISS manifest ({e}). Rebuilding...")
+
+                if is_index_valid:
                     try:
                         self.vectorstore = FAISS.load_local(
                             str(FAISS_STORE_DIR),
                             self.embeddings,
                             allow_dangerous_deserialization=True,
                         )
-                        print(f"[RAG] Successfully loaded persistent FAISS index from {FAISS_STORE_DIR}/")
+                        print(f"[RAG] Successfully loaded verified FAISS index ({len(child_docs)} chunks) from {FAISS_STORE_DIR}/")
                     except Exception as e:
                         print(f"[RAG] FAISS disk load error ({e}), rebuilding index...")
-                        self.vectorstore = FAISS.from_documents(
-                            child_docs,
-                            self.embeddings,
-                            distance_strategy=DistanceStrategy.COSINE,
-                        )
-                        FAISS_STORE_DIR.mkdir(parents=True, exist_ok=True)
-                        self.vectorstore.save_local(str(FAISS_STORE_DIR))
+                        self._build_and_save_vectorstore(child_docs)
                 else:
-                    self.vectorstore = FAISS.from_documents(
-                        child_docs,
-                        self.embeddings,
-                        distance_strategy=DistanceStrategy.COSINE,
-                    )
-                    FAISS_STORE_DIR.mkdir(parents=True, exist_ok=True)
-                    self.vectorstore.save_local(str(FAISS_STORE_DIR))
-                    print(f"[RAG] Created and saved new FAISS index with {len(child_docs)} child chunks to {FAISS_STORE_DIR}/")
+                    self._build_and_save_vectorstore(child_docs)
             except Exception as e:
                 print(f"[RAG] Vectorstore initialization warning: {e}")
 
         if BM25Retriever is not None:
             self.bm25_retriever = BM25Retriever.from_documents(child_docs if child_docs else self.docs)
-            self.bm25_retriever.k = 3
+            self.bm25_retriever.k = 4
 
         if CrossEncoder is not None:
             try:
@@ -382,6 +515,7 @@ class RAGPipeline:
             except Exception as e:
                 print(f"[RAG] CrossEncoder initialization warning: {e}")
 
+        self._build_ensemble_retriever()
         self.is_initialized = True
         print(f"[RAG] Pipeline initialized successfully with {len(self.docs)} parent docs and {len(child_docs)} child chunks.")
 
@@ -399,20 +533,15 @@ class RAGPipeline:
 
         if self.embeddings and self.docs and FAISS is not None:
             try:
-                self.vectorstore = FAISS.from_documents(
-                    child_docs,
-                    self.embeddings,
-                    distance_strategy=DistanceStrategy.COSINE,
-                )
-                FAISS_STORE_DIR.mkdir(parents=True, exist_ok=True)
-                self.vectorstore.save_local(str(FAISS_STORE_DIR))
-                print(f"[RAG] Vectorstore updated and saved to {FAISS_STORE_DIR}/ with {len(child_docs)} child chunks.")
+                self._build_and_save_vectorstore(child_docs)
             except Exception as err:
                 print(f"[RAG] Vectorstore reload error: {err}")
 
         if BM25Retriever is not None:
             self.bm25_retriever = BM25Retriever.from_documents(child_docs if child_docs else self.docs)
             self.bm25_retriever.k = 3
+
+        self._build_ensemble_retriever()
 
     def get_llm(
         self,
@@ -429,7 +558,9 @@ class RAGPipeline:
             return ChatOllama(
                 model="qwen3.5:4b",
                 temperature=0.0,
-                reasoning=think_mode,
+                reasoning="low" if think_mode else False,
+                num_ctx=8192,
+                num_predict=4096,
                 base_url=ollama_url,
             )
         else:
@@ -454,12 +585,20 @@ class RAGPipeline:
                 print(f"[RAG] Connecting to external llama.cpp server at {llama_url}")
                 try:
                     from langchain_openai import ChatOpenAI
+                    extra_b = {}
+                    if not think_mode:
+                        extra_b["reasoning_effort"] = "none"
+                    else:
+                        extra_b["reasoning_effort"] = "low"
                     return ChatOpenAI(
                         base_url=f"{llama_url.rstrip('/')}/v1",
                         api_key="not-needed",
                         model="qwen3.5:4b",
                         temperature=0.0,
                         streaming=True,
+                        max_tokens=4096,
+                        extra_body=extra_b,
+                        timeout=180.0,
                     )
                 except Exception as e:
                     print(f"[RAG] Error initializing ChatOpenAI client: {e}, falling back to in-process LlamaCpp")
@@ -470,6 +609,7 @@ class RAGPipeline:
                 temperature=0.0,
                 n_gpu_layers=-1,
                 n_ctx=8192,
+                max_tokens=4096,
                 verbose=False,
             )
 
@@ -479,14 +619,46 @@ class RAGPipeline:
         history: List[Dict[str, Any]],
         provider: str = "Ollama",
         think: bool = False,
-        rerank: bool = True,
+        rerank: bool = False,
         debug: bool = False,
         ollama_base_url: Optional[str] = None,
         llamacpp_server_url: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """Stream response tokens for a given prompt and conversation history."""
+        ollama_url = ollama_base_url or settings.model.ollama_base_url
+        llama_url = llamacpp_server_url or settings.model.llamacpp_server_url
+
         if not self.is_initialized:
             self.initialize()
+
+        # Level 0 Direct Curated Roundup Bypass (0ms execution, zero LLM cost, no hallucination)
+        from backend.database import get_opportunity_by_title_or_query
+        curated_match = get_opportunity_by_title_or_query(prompt)
+        if curated_match and curated_match.get("is_curated") == 1:
+            from backend.agent import format_curated_roundup
+            formatted_answer = format_curated_roundup(curated_match)
+            if formatted_answer:
+                print(f"[RAG] Curated Roundup direct match HIT for '{prompt}'. Returning direct structured response.")
+                meta_info = {
+                    "initial_docs": [curated_match.get("title", "Curated Roundup")],
+                    "is_opportunity": True,
+                    "debug": debug,
+                }
+                if debug:
+                    meta_info["debug_info"] = {
+                        "route_target": "curated_roundup_direct",
+                        "used_tools": ["curated_roundup_bypass"],
+                    }
+                yield f"[[METADATA]]{json.dumps(meta_info)}\n"
+                chunk_sz = 64
+                for i in range(0, len(formatted_answer), chunk_sz):
+                    piece = formatted_answer[i : i + chunk_sz]
+                    yield f"[[CONTENT]]{json.dumps(piece)}\n"
+                return
+
+        # Ensure retriever is ready (initialized once during startup/reload)
+        if self.ensemble_retriever is None:
+            self._build_ensemble_retriever()
 
         # --- Semantic answer cache (single-turn requests only) ---
         # Multi-turn answers depend on conversation context; debug bypasses so the
@@ -526,61 +698,48 @@ class RAGPipeline:
                 yield f"[[METADATA]]{json.dumps(cached_meta)}\n"
                 answer_text = cached["answer"]
                 for i in range(0, len(answer_text), 32):
-                    yield answer_text[i : i + 32]
+                    piece = answer_text[i : i + 32]
+                    yield f"[[CONTENT]]{json.dumps(piece)}\n"
                 return
 
-        if self.vectorstore is not None and self.bm25_retriever is not None:
-            dense_retriever = self.vectorstore.as_retriever(
-                search_type="mmr",
-                search_kwargs={"k": 7, "fetch_k": 15, "lambda_mult": 0.5},
-            )
-            ensemble_retriever = EnsembleRetriever(
-                retrievers=[self.bm25_retriever, dense_retriever],
-                weights=[0.4, 0.6],
-            )
-        else:
-            ensemble_retriever = self.bm25_retriever
+        # Agent resolves routing (casual chat -> no tools, otherwise local search / deep dive / web)
+        from backend.agent import OpportunityAgentGraph
 
-        self.ensemble_retriever = ensemble_retriever
+        agent_res = await OpportunityAgentGraph(self).run_agent_workflow(
+            prompt=prompt,
+            history=history,
+            rerank=rerank,
+        )
+        cleaned_info = agent_res.get("context_text", "")
+        used_tools = agent_res.get("used_tools", [])
+        initial_docs = agent_res.get("retrieved_docs", [])
+        tool_data = agent_res.get("tool_data", {})
+        # Only use the opportunity template if relevant context actually exists
+        is_opportunity_prompt = bool(cleaned_info.strip())
 
-        # Level 1 Fast Python Router (0.01 ms execution)
-        from backend.agent import fast_router, RouteTarget, OpportunityAgentGraph
-
-        route = fast_router(prompt)
-        is_opportunity_prompt = (route == RouteTarget.AGENT_TOOLS)
-
-        cleaned_info = ""
-        used_tools = []
-        initial_docs = []
-
-        if is_opportunity_prompt:
-            agent_graph = OpportunityAgentGraph(self)
-            agent_res = await agent_graph.run_agent_workflow(
-                prompt=prompt,
-                history=history,
-                provider=provider,
-                think=think,
-                ollama_base_url=ollama_base_url,
-                llamacpp_server_url=llamacpp_server_url,
-            )
-            cleaned_info = agent_res.get("context_text", "")
-            used_tools = agent_res.get("used_tools", [])
-            initial_docs = agent_res.get("retrieved_docs", [])
-            has_tool_call = agent_res.get("has_tool_call", False)
-            is_opportunity_prompt = is_opportunity_prompt and (has_tool_call or bool(cleaned_info.strip()))
+        think_instruction = "5. Keep internal thinking concise and proceed directly to provide the full response.\n" if think else ""
 
         system_template_for_opportunities = (
             "You are Anna, a helpful assistant for people looking for scholarships and internships. "
-            "The current date is {current_date}. This date is the actual current/today's date.\n\n"
+            "The current/today's date is {current_date}. \n\n"
             "INSTRUCTIONS:\n"
             "1. Answer the user's question based ONLY on the provided Context.\n"
             "2. If the Context doesn't contain the answer, say 'I don't have information about that in my current database.'\n"
             "3. Be concise, friendly, and encouraging.\n"
-            "4. For EACH opportunity, strictly format it in this order:\n"
+            "4. For EACH opportunity, format it clearly:\n"
             "   a. Title / Heading (e.g. ### 1. Opportunity Name)\n"
-            "   b. Description paragraph (key benefits, eligibility, duration, details)\n"
-            "   c. AT THE VERY BOTTOM of that opportunity (after the description), add a single metadata line:\n"
-            "      • Deadline: <Date> | Organization: <Name> | Location: <Location> | Type: <Funding/Category>\n"
+            "   b. Description (key benefits, eligibility, duration, organization, location, deadline, and application details)\n"
+            + think_instruction
+        )
+
+        system_template_for_web = (
+            "You are Anna, a helpful assistant. The current/today's date is {current_date}. \n\n"
+            "INSTRUCTIONS:\n"
+            "1. Answer the user's question directly, accurately, and concisely based on the provided Context / Web Search Results.\n"
+            "2. If the Context contains the answer, summarize the facts clearly without inventing information.\n"
+            "3. If the Context does not contain the answer, say 'I don't have information about that.'\n"
+            "4. Be friendly and helpful.\n"
+            + think_instruction
         )
 
         system_template_without_opportunities = (
@@ -589,12 +748,15 @@ class RAGPipeline:
             "1. Answer the user's question based on your general knowledge if the question is not related to scholarships/internships/opportunities.\n"
             "2. If the question is related to scholarships/internships/opportunities, strictly tell the user that you don't have the information available.\n"
             "3. Be concise, friendly, and playful.\n"
+            + think_instruction
         )
 
-        # Smart template switch: only use opportunity template if relevant context actually exists
-        is_opportunity_prompt = is_opportunity_prompt and bool(cleaned_info.strip())
-
-        system_template = system_template_for_opportunities if is_opportunity_prompt else system_template_without_opportunities
+        if "search_live_web" in used_tools:
+            system_template = system_template_for_web
+        elif is_opportunity_prompt:
+            system_template = system_template_for_opportunities
+        else:
+            system_template = system_template_without_opportunities
         system_msg = SystemMessagePromptTemplate.from_template(system_template)
 
         human_template_for_opportunities = (
@@ -632,14 +794,6 @@ class RAGPipeline:
         if is_opportunity_prompt:
             input_data["relevant_info"] = cleaned_info
 
-        llm = self.get_llm(
-            provider=provider,
-            think_mode=think,
-            ollama_base_url=ollama_base_url,
-            llamacpp_server_url=llamacpp_server_url,
-        )
-        chain = chat_prompt | llm | StrOutputParser()
-
         # Format exact System and Human prompts with variables filled in for debugging
         formatted_sys_prompt = system_template.format(current_date=CURRENT_DATE_STR)
         if is_opportunity_prompt:
@@ -666,12 +820,13 @@ class RAGPipeline:
             "is_opportunity": is_opportunity_prompt,
             "used_tools": used_tools,
             "initial_docs": doc_names,
+            "tool_data": tool_data,
             "debug": debug,
         }
 
         if debug:
             meta_info["debug_info"] = {
-                "route_target": route.value if hasattr(route, "value") else str(route),
+                "route_target": "agent_tools" if used_tools else "direct_chat",
                 "formatted_system_prompt": formatted_sys_prompt,
                 "formatted_human_prompt": formatted_human_prompt,
                 "filled_variables": input_data,
@@ -681,14 +836,175 @@ class RAGPipeline:
         yield f"[[METADATA]]{json.dumps(meta_info)}\n"
 
         generated_chunks: List[str] = []
-        for chunk in chain.stream(input_data):
-            chunk_str = chunk if isinstance(chunk, str) else getattr(chunk, "content", str(chunk))
-            generated_chunks.append(chunk_str)
-            yield chunk_str
+        try:
+            # Check if external llama-server is running when provider is LLamaCPP
+            use_external = False
+            if provider != "Ollama":
+                try:
+                    import urllib.request
+                    req = urllib.request.Request(f"{llama_url.rstrip('/')}/health", headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=1) as resp:
+                        if resp.status in (200, 204):
+                            use_external = True
+                except Exception:
+                    try:
+                        req = urllib.request.Request(f"{llama_url.rstrip('/')}/", headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req, timeout=1) as resp:
+                            if resp.status in (200, 404, 405):
+                                use_external = True
+                    except Exception:
+                        use_external = False
 
-        if cacheable and generated_chunks:
+            if use_external and provider != "Ollama":
+                from openai import AsyncOpenAI
+                client = AsyncOpenAI(base_url=f"{llama_url.rstrip('/')}/v1", api_key="not-needed", timeout=180.0)
+                openai_messages = [
+                    {"role": "system", "content": formatted_sys_prompt},
+                    {"role": "user", "content": formatted_human_prompt},
+                ]
+                budget = settings.model.reasoning_budget if think else 0
+                extra_kwargs = {
+                    "extra_body": {
+                        "reasoning_budget": budget,
+                        "chat_template_kwargs": {
+                            "enable_thinking": bool(think),
+                        },
+                    }
+                }
+                if not think:
+                    extra_kwargs["reasoning_effort"] = "none"
+                else:
+                    extra_kwargs["reasoning_effort"] = "low"
+
+                stream = await client.chat.completions.create(
+                    model="qwen3.5:4b",
+                    messages=openai_messages,
+                    stream=True,
+                    max_tokens=4096,
+                    temperature=0.0,
+                    **extra_kwargs,
+                )
+                async for chunk in stream:
+                    delta = chunk.choices[0].delta
+                    reasoning = getattr(delta, "reasoning_content", None)
+                    if reasoning and think:
+                        yield f"[[THINK]]{json.dumps(reasoning)}\n"
+                    if delta.content:
+                        generated_chunks.append(delta.content)
+                        yield f"[[CONTENT]]{json.dumps(delta.content)}\n"
+            else:
+                llm = self.get_llm(
+                    provider=provider,
+                    think_mode=think,
+                    ollama_base_url=ollama_base_url,
+                    llamacpp_server_url=llamacpp_server_url,
+                )
+                chain = chat_prompt | llm | StrOutputParser()
+                in_think = False
+                think_chars_emitted = 0
+                max_think_chars = (settings.model.reasoning_budget or 1000) * 4
+                buf = ""
+                async for raw_chunk in chain.astream(input_data):
+                    chunk_text = raw_chunk if isinstance(raw_chunk, str) else getattr(raw_chunk, "content", str(raw_chunk))
+                    if not chunk_text:
+                        continue
+                    buf += chunk_text
+                    while buf:
+                        if not in_think:
+                            if "<think>" in buf:
+                                idx = buf.find("<think>")
+                                normal_part = buf[:idx]
+                                if normal_part:
+                                    generated_chunks.append(normal_part)
+                                    yield f"[[CONTENT]]{json.dumps(normal_part)}\n"
+                                in_think = True
+                                buf = buf[idx + len("<think>"):]
+                            else:
+                                possible_tag = False
+                                for i in range(1, len("<think>")):
+                                    if buf.endswith("<think>"[:i]):
+                                        possible_tag = True
+                                        normal_part = buf[:-i]
+                                        if normal_part:
+                                            generated_chunks.append(normal_part)
+                                            yield f"[[CONTENT]]{json.dumps(normal_part)}\n"
+                                        buf = buf[-i:]
+                                        break
+                                if not possible_tag:
+                                    generated_chunks.append(buf)
+                                    yield f"[[CONTENT]]{json.dumps(buf)}\n"
+                                    buf = ""
+                                break
+                        else:
+                            if "</think>" in buf:
+                                idx = buf.find("</think>")
+                                think_part = buf[:idx]
+                                if think_part and think:
+                                    think_chars_emitted += len(think_part)
+                                    yield f"[[THINK]]{json.dumps(think_part)}\n"
+                                in_think = False
+                                buf = buf[idx + len("</think>"):]
+                            else:
+                                possible_tag = False
+                                for i in range(1, len("</think>")):
+                                    if buf.endswith("</think>"[:i]):
+                                        possible_tag = True
+                                        think_part = buf[:-i]
+                                        if think_part and think:
+                                            think_chars_emitted += len(think_part)
+                                            yield f"[[THINK]]{json.dumps(think_part)}\n"
+                                        buf = buf[-i:]
+                                        break
+                                if not possible_tag:
+                                    if think:
+                                        think_chars_emitted += len(buf)
+                                        yield f"[[THINK]]{json.dumps(buf)}\n"
+                                    buf = ""
+                                if think_chars_emitted >= max_think_chars:
+                                    in_think = False
+                                break
+                if buf:
+                    if in_think:
+                        if think:
+                            yield f"[[THINK]]{json.dumps(buf)}\n"
+                    else:
+                        generated_chunks.append(buf)
+                        yield f"[[CONTENT]]{json.dumps(buf)}\n"
+        except Exception as exc:
+            err_name = type(exc).__name__
+            err_str = str(exc)
+            if "ConnectError" in err_name or "10061" in err_str or "ConnectionRefused" in err_name:
+                srv_target = f"Ollama at {ollama_url}" if provider == "Ollama" else f"llama-server at {llama_url}"
+                msg = (
+                    f"\n\n> ⚠️ **Inference Connection Failed**: Could not connect to **{srv_target}**.\n"
+                    f"> - If using **Ollama**, make sure it is running (`ollama serve` or open the Ollama app).\n"
+                    f"> - If using **llama.cpp**, make sure `llama-server` is running or switch the **Model Provider** in the sidebar."
+                )
+                print(f"[RAG] Connection failed to {srv_target}: {exc}")
+                yield f"[[CONTENT]]{json.dumps(msg)}\n"
+            else:
+                print(f"[RAG] Generation error: {exc}")
+                yield f"[[CONTENT]]{json.dumps(f'\\n\\n> ⚠️ **Inference Error**: {exc}')}\n"
+
+        if not generated_chunks:
+            fallback_msg = "\n\n> ⚠️ *The model finished thinking but produced no final output (token budget reached). Please try asking again or toggle off Think mode.*"
+            generated_chunks.append(fallback_msg)
+            yield f"[[CONTENT]]{json.dumps(fallback_msg)}\n"
+
+        full_ans = "".join(generated_chunks)
+        should_store = (
+            cacheable
+            and bool(full_ans.strip())
+            and "search_live_web" not in used_tools
+            and "don't have information about that" not in full_ans.lower()
+            and "not have information about that" not in full_ans.lower()
+            and "inference error" not in full_ans.lower()
+            and "connection failed" not in full_ans.lower()
+        )
+
+        if should_store:
             try:
-                self.answer_cache.store(prompt, query_vec, config_hash, "".join(generated_chunks), meta_info)
+                self.answer_cache.store(prompt, query_vec, config_hash, full_ans, meta_info)
                 print("[RAG] Answer-cache MISS -> response stored for future reuse.")
             except Exception as exc:
                 print(f"[RAG] Answer-cache store failed: {exc}")

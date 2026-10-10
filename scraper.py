@@ -8,6 +8,7 @@ from scrapers.opportunitiescorner import OpportunitiesCorners
 from scrapers.opportunitiesforyouth import OpportunitiesForYouth
 from config import settings
 import icecream as ic
+from backend.text_utils import is_english_content
 
 class CombinedScraper:
     def __init__(self, days_back=settings.scraper.days_back, threshold=settings.scraper.score_threshold):
@@ -88,43 +89,30 @@ class CombinedScraper:
             ic.ic(f"OpportunitiesCorners failed: {opportunitiescorner_data}")
             opportunitiescorner_data = []
 
-        # Combine the results
-        combined_results = youthop_data + greatyop_data + scholars4dev_data + scholarshipscorner_data + opportunitiescorner_data + opportunitiesforyouth_data
+        # Combine and filter for English opportunities only
+        raw_combined = youthop_data + greatyop_data + scholars4dev_data + scholarshipscorner_data + opportunitiescorner_data + opportunitiesforyouth_data
+        combined_results = [
+            item for item in raw_combined
+            if is_english_content(item.get("name") or item.get("title", ""), item.get("content", ""))
+        ]
+        non_en_count = len(raw_combined) - len(combined_results)
+        if non_en_count > 0:
+            ic.ic(f"Filtered out {non_en_count} non-English opportunities.")
 
         ic.ic("type of combined_results:", type(combined_results))
 
+        # 1. Save raw scraped data to disk
         with open("scraped_data.txt", "w", encoding='utf-8') as f:
             json.dump(combined_results, f, indent=2)
 
-        # Inline rules-based metadata extraction (fast, deterministic)
-        if settings.scraper.extract_metadata:
-            from backend.metadata_extractor import extract_metadata_rules
-            for item in combined_results:
-                item["metadata"] = extract_metadata_rules(
-                    item.get("name") or item.get("title") or "",
-                    item.get("content") or "",
-                )
-
-        # Upsert into SQLite database
+        # 2. Upsert raw items into SQLite database
         row_ids = []
         try:
             from backend.database import upsert_opportunities
             row_ids = upsert_opportunities(combined_results)
-            ic.ic(f"Upserted {len(row_ids)} opportunities to SQLite database.")
+            ic.ic(f"Upserted {len(row_ids)} raw opportunities to SQLite database.")
         except Exception as err:
             ic.ic(f"Error saving to SQLite database: {err}")
-
-        # Background LLM enrichment for opportunities with missing metadata fields
-        if settings.scraper.llm_enrichment and row_ids:
-            from backend.metadata_extractor import enrich_missing_metadata, find_missing_fields
-            incomplete = [
-                (row_id, item)
-                for row_id, item in zip(row_ids, combined_results)
-                if row_id != -1 and find_missing_fields(item.get("metadata"))
-            ]
-            if incomplete:
-                ic.ic(f"Scheduling LLM metadata enrichment for {len(incomplete)} opportunities...")
-                self.enrichment_task = asyncio.create_task(enrich_missing_metadata(incomplete))
 
         print(f"\n{'='*60}")
         print("SCRAPING SUMMARY")
@@ -135,23 +123,19 @@ class CombinedScraper:
         print(f"Source: ScholarshipsCorner   | Items: {len(scholarshipscorner_data):3d}")
         print(f"Source: OpportunitiesCorners | Items: {len(opportunitiescorner_data):3d}")
         print(f"Source: OpportunitiesForYouth| Items: {len(opportunitiesforyouth_data):3d}")
+        print(f"Source: Filtered Out (Non-English) | Items: {non_en_count:3d}")
         print(f"{'='*60}")
         print(f"Total Combined Opportunities | Items: {len(combined_results):3d}")
         print(f"{'='*60}")
-        print("Output File: scraped_data.txt & SQLite Database")
+        # print("Output: scraped_data.txt & SQLite Database")
+        print("Next Step: Run 'python extract.py' to extract structured profiles (SLM + regex fallback)")
         print(f"{'='*60}\n")
 
         return combined_results
 
     async def await_enrichment(self):
-        """Wait for the background LLM metadata enrichment task, if scheduled."""
-        if self.enrichment_task is not None:
-            try:
-                await self.enrichment_task
-            except Exception as err:
-                ic.ic(f"Metadata enrichment failed: {err}")
-            finally:
-                self.enrichment_task = None
+        """No-op stub kept for backwards compatibility with background job callers."""
+        pass
 
 async def main():
     scraper = CombinedScraper(

@@ -12,7 +12,7 @@ class ChatRequest(BaseModel):
     conversation_history: List[ChatMessage] = Field(default_factory=list, description="Recent conversation history")
     provider: str = Field(default="Ollama", description="LLM provider: 'Ollama' or 'LLamaCPP'")
     think: bool = Field(default=False, description="Enable thinking/reasoning mode if supported")
-    rerank: bool = Field(default=True, description="Enable re-ranking of retrieved document chunks")
+    rerank: bool = Field(default=False, description="Enable re-ranking of retrieved document chunks")
     debug: bool = Field(default=False, description="Enable debug mode to expose prompt and retrieval details")
     ollama_base_url: Optional[str] = Field(default=None, description="Optional override for Ollama API server base URL")
     llamacpp_server_url: Optional[str] = Field(default=None, description="Optional override for llama.cpp HTTP server URL")
@@ -21,18 +21,6 @@ class ChatResponse(BaseModel):
     session_id: str
     response: str
     metadata: Optional[dict] = None
-
-class OpportunityCard(BaseModel):
-    title: str = Field(..., description="Title or name of the opportunity")
-    organization: Optional[str] = Field(None, description="Host organization or university")
-    location: Optional[str] = Field(None, description="Country or 'Remote'/'Hybrid'")
-    deadline: Optional[str] = Field(None, description="Application closing date")
-    type: Optional[str] = Field(None, description="Category, e.g. 'Fellowship', 'Fully Funded'")
-    application_url: Optional[str] = Field(None, description="Direct URL or portal link")
-
-class StructuredChatResponse(BaseModel):
-    answer_summary: str = Field(..., description="Friendly intro/outro conversational message")
-    cards: List[OpportunityCard] = Field(default_factory=list, description="Structured cards for items with metadata")
 
 class SessionCreate(BaseModel):
     title: Optional[str] = Field(default="New Chat", description="Optional title for the chat session")
@@ -62,15 +50,53 @@ class HealthResponse(BaseModel):
     cache_misses: int = 0
     cache_entries: int = 0
 
+class OpportunityProfile(BaseModel):
+    title: str = Field(description="Official, clean opportunity title without clickbait")
+    organization: Optional[str] = Field(None, description="Host institution, university, or company")
+    location: Optional[str] = Field(None, description="Country or city where it takes place, or 'Remote'")
+    deadline: Optional[str] = Field(None, description="Application deadline in YYYY-MM-DD format or readable date")
+    type: Optional[str] = Field(None, description="Category: Fully Funded Scholarship, Fellowship, Internship, Grant, etc.")
+    eligibility: Optional[str] = Field(None, description="1-2 sentences summarizing who is eligible")
+    benefits: Optional[str] = Field(None, description="1-2 sentences summarizing funding, stipend, travel, coverage, etc.")
+    summary: str = Field(description="3-4 crisp sentences summarizing what this opportunity is and what it offers")
+
+
+class SLMExtractionSchema(BaseModel):
+    """Strict non-null extraction schema for GBNF grammar decoding with SLM."""
+    organization: str = Field(
+        description="Host institution, university, government, or company. Use 'Not specified' if unknown."
+    )
+    location: str = Field(
+        description="Country, city, or 'Remote'. Use 'Not specified' if unknown."
+    )
+    deadline: str = Field(
+        description="Application deadline date or 'Not specified'."
+    )
+    type: str = Field(
+        description="Category: Fully Funded Scholarship, Fellowship, Internship, Grant, etc."
+    )
+    eligibility: str = Field(
+        description="1-2 sentences summarizing who is eligible."
+    )
+    benefits: str = Field(
+        description="1-2 sentences summarizing funding, stipend, travel, coverage, etc."
+    )
+    summary: str = Field(
+        description="3-4 crisp sentences summarizing what this opportunity is and what it offers."
+    )
+
+
 class OpportunityItem(BaseModel):
     id: int
     title: str
-    content: str
+    content: Optional[str] = ""
     source: Optional[str] = None
     url: Optional[str] = None
     created_at: str
     deadline: Optional[str] = Field(None, description="Application deadline in ISO format (YYYY-MM-DD)")
     metadata: Optional[dict] = Field(None, description="Extracted metadata: organization, location, type, deadline")
+    profile: Optional[dict] = Field(None, description="Distilled opportunity profile extracted via SLM")
+    is_curated: int = Field(default=0, description="1 if curated roundup/list, 0 for single opportunity")
 
 class OpportunitiesResponse(BaseModel):
     total: int

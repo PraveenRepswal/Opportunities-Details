@@ -36,6 +36,7 @@ from backend.database import (
     add_message,
     delete_session,
     list_opportunities,
+    list_curated_opportunities,
     get_opportunity_by_id,
 )
 from scraper import CombinedScraper
@@ -88,11 +89,14 @@ if settings.api.rate_limit_enabled:
         trust_forwarded_for=settings.api.rate_limit_trust_proxy,
     )
 
-# Enable CORS for all clients (mobile, web frontends, Streamlit, etc.)
+# Enable CORS for clients (mobile, web frontends, Streamlit, etc.)
+# Per browser standards, wildcard "*" cannot be combined with allow_credentials=True
+cors_origins = settings.api.cors_origins
+allow_credentials = False if "*" in cors_origins else True
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.api.cors_origins,
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -154,7 +158,6 @@ async def health_check():
 
 # --- CHAT ENDPOINTS ---
 @router_v1.post("/chat", response_model=ChatResponse)
-@app.post("/chat", response_model=ChatResponse, include_in_schema=False)
 async def chat_completion(request: ChatRequest):
     """Standard non-streaming REST endpoint for chat completions."""
     try:
@@ -204,29 +207,7 @@ async def chat_completion(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def extract_cards_from_response(text: str) -> List[dict]:
-    """Extract opportunity card metadata from text metadata lines."""
-    cards = []
-    for line in text.split("\n"):
-        line_clean = line.strip()
-        if ("Deadline:" in line_clean or "Organization:" in line_clean or "Location:" in line_clean) and "|" in line_clean:
-            item = {}
-            for part in line_clean.split("|"):
-                part = part.strip().lstrip("•*- ").strip()
-                if ":" in part:
-                    k, v = part.split(":", 1)
-                    key_norm = k.strip().lower()
-                    val_norm = v.strip().replace("**", "").replace("*", "").strip()
-                    if key_norm in ("deadline", "organization", "location", "type", "title"):
-                        item[key_norm] = val_norm
-            if item:
-                cards.append(item)
-    return cards
-
-
 @router_v1.post("/chat/stream")
-@app.post("/chat/stream", include_in_schema=False)
-@app.post("/api/chat/stream", include_in_schema=False)
 async def chat_stream(request: ChatRequest):
     """Stream chat completion response chunk by chunk with automatic SQLite persistence."""
     try:
@@ -249,29 +230,56 @@ async def chat_stream(request: ChatRequest):
 
         async def database_persisting_generator():
             full_response = ""
+            full_thinking = ""
             metadata_dict = None
+            line_buf = ""
             async for chunk in raw_generator:
                 chunk_str = chunk if isinstance(chunk, str) else str(chunk)
-                if "[[METADATA]]" in chunk_str:
-                    for line in chunk_str.split("\n"):
-                        if line.startswith("[[METADATA]]"):
-                            try:
-                                metadata_dict = json.loads(line.replace("[[METADATA]]", "").strip())
-                            except Exception:
-                                pass
-                else:
-                    full_response += chunk_str
+                line_buf += chunk_str
+                while "\n" in line_buf:
+                    line, line_buf = line_buf.split("\n", 1)
+                    line_s = line.strip()
+                    if not line_s:
+                        continue
+                    if line_s.startswith("[[METADATA]]"):
+                        try:
+                            metadata_dict = json.loads(line_s[len("[[METADATA]]"):].strip())
+                        except Exception:
+                            pass
+                    elif line_s.startswith("[[THINK]]"):
+                        try:
+                            think_text = json.loads(line_s[len("[[THINK]]"):].strip())
+                        except Exception:
+                            think_text = line_s[len("[[THINK]]"):]
+                        full_thinking += think_text
+                    elif line_s.startswith("[[CONTENT]]"):
+                        try:
+                            content_text = json.loads(line_s[len("[[CONTENT]]"):].strip())
+                        except Exception:
+                            content_text = line_s[len("[[CONTENT]]"):]
+                        full_response += content_text
+                    else:
+                        full_response += line
 
                 yield chunk_str
 
+            if line_buf.strip():
+                line_s = line_buf.strip()
+                if line_s.startswith("[[CONTENT]]"):
+                    try:
+                        content_text = json.loads(line_s[len("[[CONTENT]]"):].strip())
+                        full_response += content_text
+                    except Exception:
+                        pass
+                elif not line_s.startswith("[["):
+                    full_response += line_s
+
             if session_id and full_response:
                 clean_text = strip_thinking_tags(full_response)
-                cards = extract_cards_from_response(full_response)
-                if cards:
-                    if metadata_dict is None:
-                        metadata_dict = {}
-                    metadata_dict["opportunity_cards"] = cards
-
+                if metadata_dict is None:
+                    metadata_dict = {}
+                if full_thinking.strip():
+                    metadata_dict["thinking"] = full_thinking.strip()
                 add_message(
                     session_id=session_id,
                     role="assistant",
@@ -286,15 +294,17 @@ async def chat_stream(request: ChatRequest):
 
 # --- OPPORTUNITIES ENDPOINTS ---
 @router_v1.get("/opportunities", response_model=OpportunitiesResponse)
-@app.get("/opportunities", response_model=OpportunitiesResponse, include_in_schema=False)
 async def get_opportunities_list(
     query: Optional[str] = Query(None, description="Search keyword for opportunity title or content"),
     source: Optional[str] = Query(None, description="Filter by opportunity portal source"),
-    limit: int = Query(20, ge=1, le=100, description="Page size limit"),
+    limit: int = Query(500, ge=1, le=1000, description="Page size limit"),
     offset: int = Query(0, ge=0, description="Offset position for pagination"),
+    include_content: bool = Query(True, description="Whether to include full raw content body in list items"),
 ):
-    """Retrieve paginated opportunities list with search and source filtering."""
-    result = list_opportunities(query=query, source=source, limit=limit, offset=offset)
+    """Retrieve paginated opportunities list with search, source filtering, and content toggle."""
+    result = list_opportunities(
+        query=query, source=source, limit=limit, offset=offset, include_content=include_content
+    )
     return OpportunitiesResponse(
         total=result["total"],
         limit=result["limit"],
@@ -303,8 +313,14 @@ async def get_opportunities_list(
     )
 
 
+@router_v1.get("/opportunities/curated", response_model=List[OpportunityItem])
+async def get_curated_opportunities_list(limit: int = Query(50, ge=1, le=100)):
+    """Retrieve list of high-value curated roundups and Top-N compilations."""
+    items = list_curated_opportunities(limit=limit)
+    return [OpportunityItem(**it) for it in items]
+
+
 @router_v1.get("/opportunities/{opp_id}", response_model=OpportunityItem)
-@app.get("/opportunities/{opp_id}", response_model=OpportunityItem, include_in_schema=False)
 async def get_opportunity_detail(opp_id: int):
     """Retrieve detail of a specific opportunity by ID."""
     item = get_opportunity_by_id(opp_id)
@@ -315,7 +331,6 @@ async def get_opportunity_detail(opp_id: int):
 
 # --- SCRAPE ENDPOINTS ---
 @router_v1.post("/scrape", response_model=ScrapeResponse)
-@app.post("/scrape", response_model=ScrapeResponse, include_in_schema=False)
 async def trigger_scrape_job(payload: ScrapeRequest, background_tasks: BackgroundTasks):
     """Trigger background scraping job across portals and reload RAG vectorstore upon completion."""
     global scrape_job_state
@@ -343,7 +358,6 @@ async def trigger_scrape_job(payload: ScrapeRequest, background_tasks: Backgroun
 
 
 @router_v1.get("/scrape/status", response_model=ScrapeResponse)
-@app.get("/scrape/status", response_model=ScrapeResponse, include_in_schema=False)
 async def get_scrape_job_status():
     """Get the current or latest scraping job execution status."""
     return ScrapeResponse(
@@ -356,16 +370,12 @@ async def get_scrape_job_status():
 
 # --- SESSION MANAGEMENT ENDPOINTS ---
 @router_v1.get("/sessions", response_model=List[SessionResponse])
-@app.get("/sessions", response_model=List[SessionResponse], include_in_schema=False)
-@app.get("/api/sessions", response_model=List[SessionResponse], include_in_schema=False)
 async def get_all_sessions():
     """List all chat sessions."""
     return list_sessions()
 
 
 @router_v1.post("/sessions", response_model=SessionResponse)
-@app.post("/sessions", response_model=SessionResponse, include_in_schema=False)
-@app.post("/api/sessions", response_model=SessionResponse, include_in_schema=False)
 async def create_new_session(payload: SessionCreate):
     """Create a new chat session."""
     sid = create_session(title=payload.title or "New Chat")
@@ -378,16 +388,12 @@ async def create_new_session(payload: SessionCreate):
 
 
 @router_v1.get("/sessions/{session_id}/messages", response_model=List[MessageItem])
-@app.get("/sessions/{session_id}/messages", response_model=List[MessageItem], include_in_schema=False)
-@app.get("/api/sessions/{session_id}/messages", response_model=List[MessageItem], include_in_schema=False)
 async def get_messages(session_id: str):
     """Get all messages for a specific session."""
     return get_session_messages(session_id)
 
 
 @router_v1.delete("/sessions/{session_id}")
-@app.delete("/sessions/{session_id}", include_in_schema=False)
-@app.delete("/api/sessions/{session_id}", include_in_schema=False)
 async def delete_chat_session(session_id: str):
     """Delete a session and its message history."""
     delete_session(session_id)
@@ -396,8 +402,6 @@ async def delete_chat_session(session_id: str):
 
 # --- SPEECH-TO-TEXT (STT) VOICE ENDPOINTS ---
 @router_v1.post("/transcribe", response_model=TranscribeResponse)
-@app.post("/transcribe", response_model=TranscribeResponse, include_in_schema=False)
-@app.post("/api/transcribe", response_model=TranscribeResponse, include_in_schema=False)
 async def transcribe_audio(file: UploadFile = File(...)):
     """Transcribe microphone audio stream or uploaded audio file using Moonshine STT."""
     try:

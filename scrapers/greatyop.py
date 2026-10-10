@@ -7,6 +7,7 @@ import asyncio
 import trafilatura
 import traceback
 import aiohttp
+from backend.text_utils import is_english_content
 
 class GreatYopScraper:
     def __init__(self, index_url, days_back=30, threshold=0.7):
@@ -88,7 +89,7 @@ class GreatYopScraper:
 
     @staticmethod
     def slugify_links(u):
-        seg = u.split("/")[-1]
+        seg = u.rstrip("/").split("/")[-1]
         s   = slugify(seg)
         return re.sub(r'-(\d{4}|\d{4}-\d{2}-\d{2})$', '', s)
 
@@ -142,6 +143,8 @@ class GreatYopScraper:
             name = self.slugify_links(url).replace("-", " ")
             if end_result:
                 end_result = end_result.replace('\n', ' ')
+                if not is_english_content(name, end_result):
+                    return None
                 count += 1
                 return {
                     "name": name,

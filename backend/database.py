@@ -1,14 +1,18 @@
 import json
+import logging
+import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+from backend.text_utils import is_english_content
+
+logger = logging.getLogger(__name__)
+
 DB_PATH = Path("opportunities_chat.db")
-
-
-from contextlib import contextmanager
 
 @contextmanager
 def get_db_connection():
@@ -20,8 +24,20 @@ def get_db_connection():
         conn.close()
 
 
-def _ensure_opportunities_schema(cursor: sqlite3.Cursor) -> None:
+_schema_ensured_dbs: set[str] = set()
+
+
+def _ensure_opportunities_schema(cursor: sqlite3.Cursor, force: bool = False) -> None:
     """Create the opportunities table if missing and migrate metadata columns."""
+    db_name = ""
+    try:
+        row = cursor.connection.execute("PRAGMA database_list").fetchone()
+        db_name = row[2] if row and len(row) > 2 else ""
+    except Exception:
+        pass
+
+    if db_name and db_name != ":memory:" and db_name in _schema_ensured_dbs and not force:
+        return
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS opportunities (
@@ -31,15 +47,59 @@ def _ensure_opportunities_schema(cursor: sqlite3.Cursor) -> None:
             source TEXT,
             url TEXT,
             content_hash TEXT UNIQUE,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            metadata_json TEXT,
+            deadline TEXT,
+            profile_json TEXT,
+            is_curated INTEGER DEFAULT 0
         )
         """
     )
-    columns = {row[1] for row in cursor.execute("PRAGMA table_info(opportunities)").fetchall()}
-    if "metadata_json" not in columns:
-        cursor.execute("ALTER TABLE opportunities ADD COLUMN metadata_json TEXT")
-    if "deadline" not in columns:
-        cursor.execute("ALTER TABLE opportunities ADD COLUMN deadline TEXT")
+
+    # Performance indexes for metadata filtering and ordering
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_opportunities_deadline ON opportunities(deadline)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_opportunities_source ON opportunities(source)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_opportunities_curated ON opportunities(is_curated)")
+
+    # SQLite FTS5 Full-Text Search Virtual Table and Automatic Triggers
+    try:
+        cursor.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS opportunities_fts USING fts5(
+                title,
+                content,
+                content='opportunities',
+                content_rowid='id'
+            );
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS opportunities_ai AFTER INSERT ON opportunities BEGIN
+                INSERT INTO opportunities_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+            END;
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS opportunities_ad AFTER DELETE ON opportunities BEGIN
+                INSERT INTO opportunities_fts(opportunities_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
+            END;
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS opportunities_au AFTER UPDATE ON opportunities BEGIN
+                INSERT INTO opportunities_fts(opportunities_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
+                INSERT INTO opportunities_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+            END;
+            """
+        )
+    except Exception:
+        pass
+
+    if db_name and db_name != ":memory:":
+        _schema_ensured_dbs.add(db_name)
 
 
 def init_db():
@@ -71,7 +131,28 @@ def init_db():
         )
         _ensure_opportunities_schema(cursor)
         conn.commit()
+    purged = purge_non_english_opportunities()
+    if purged:
+        print(f"[DB] Purged {purged} non-English opportunities from database.")
     print(f"[DB] Initialized SQLite database at {DB_PATH.resolve()}")
+
+
+def purge_non_english_opportunities() -> int:
+    """Purge all non-English opportunities currently stored in SQLite."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        _ensure_opportunities_schema(cursor)
+        cursor.execute("SELECT id, title, content FROM opportunities")
+        rows = cursor.fetchall()
+        to_delete = [
+            r["id"] for r in rows
+            if not is_english_content(r["title"] or "", r["content"] or "")
+        ]
+        if to_delete:
+            cursor.executemany("DELETE FROM opportunities WHERE id = ?", [(i,) for i in to_delete])
+            conn.commit()
+            logger.info("Purged %d non-English opportunities from database.", len(to_delete))
+        return len(to_delete)
 
 
 def create_session(session_id: Optional[str] = None, title: str = "New Chat") -> str:
@@ -206,15 +287,28 @@ def upsert_opportunities(items: List[Dict[str, Any]]) -> List[int]:
         cursor = conn.cursor()
         _ensure_opportunities_schema(cursor)
         for item in items:
-            title = item.get("name") or item.get("title") or "Untitled Opportunity"
+            title = (item.get("name") or item.get("title") or "Untitled Opportunity").strip()
             content = item.get("content") or ""
+            if not is_english_content(title, content):
+                logger.info("Skipping non-English opportunity during upsert: %s", title)
+                continue
             source = item.get("source") or item.get("portal") or ""
             url = item.get("url") or item.get("link") or ""
             metadata = item.get("metadata")
             meta_json = json.dumps(metadata) if isinstance(metadata, dict) else None
+            profile = item.get("profile")
+            profile_json = json.dumps(profile) if isinstance(profile, dict) else None
             deadline = None
             if isinstance(metadata, dict):
                 deadline = metadata.get("deadline")
+            elif isinstance(profile, dict) and profile.get("deadline"):
+                deadline = profile.get("deadline")
+
+            is_curated = int(item.get("is_curated") or 0)
+            if not is_curated:
+                t_lower = title.lower()
+                if "1#" in content or "10#" in content or t_lower.startswith("top 10") or t_lower.startswith("top scholarship"):
+                    is_curated = 1
 
             # Compute content hash
             raw_str = f"{title}:{content[:200]}"
@@ -222,8 +316,8 @@ def upsert_opportunities(items: List[Dict[str, Any]]) -> List[int]:
 
             cursor.execute(
                 """
-                INSERT INTO opportunities (title, content, source, url, content_hash, created_at, metadata_json, deadline)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO opportunities (title, content, source, url, content_hash, created_at, metadata_json, deadline, profile_json, is_curated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(content_hash) DO UPDATE SET
                     title=excluded.title,
                     content=excluded.content,
@@ -231,9 +325,11 @@ def upsert_opportunities(items: List[Dict[str, Any]]) -> List[int]:
                     url=excluded.url,
                     created_at=excluded.created_at,
                     metadata_json=COALESCE(excluded.metadata_json, opportunities.metadata_json),
-                    deadline=COALESCE(excluded.deadline, opportunities.deadline)
+                    deadline=COALESCE(excluded.deadline, opportunities.deadline),
+                    profile_json=COALESCE(excluded.profile_json, opportunities.profile_json),
+                    is_curated=CASE WHEN excluded.is_curated = 1 THEN 1 ELSE opportunities.is_curated END
                 """,
-                (title, content, source, url, content_hash, now, meta_json, deadline),
+                (title, content, source, url, content_hash, now, meta_json, deadline, profile_json, is_curated),
             )
             cursor.execute(
                 "SELECT id FROM opportunities WHERE content_hash = ?",
@@ -244,23 +340,40 @@ def upsert_opportunities(items: List[Dict[str, Any]]) -> List[int]:
         conn.commit()
     return row_ids
 
-
-def update_opportunity_metadata(opp_id: int, metadata: Dict[str, Any]) -> bool:
-    """Persist enriched metadata for an opportunity row."""
-    if not isinstance(metadata, dict):
+def update_opportunity_profile_and_metadata(opp_id: int, profile: Dict[str, Any]) -> bool:
+    """Atomically persist extracted OpportunityProfile and synchronize metadata fields."""
+    if not isinstance(profile, dict):
         return False
     with get_db_connection() as conn:
         cursor = conn.cursor()
         _ensure_opportunities_schema(cursor)
+
+        cursor.execute("SELECT metadata_json FROM opportunities WHERE id = ?", (opp_id,))
+        row = cursor.fetchone()
+        existing_meta = {}
+        if row and row["metadata_json"]:
+            try:
+                existing_meta = json.loads(row["metadata_json"]) or {}
+            except Exception:
+                existing_meta = {}
+
+        for key in ("deadline", "organization", "location", "type"):
+            val = profile.get(key)
+            if val:
+                existing_meta[key] = val
+
+        deadline = profile.get("deadline") or existing_meta.get("deadline")
+
         cursor.execute(
             """
             UPDATE opportunities
-            SET metadata_json = ?, deadline = COALESCE(?, deadline)
+            SET profile_json = ?, metadata_json = ?, deadline = COALESCE(?, deadline)
             WHERE id = ?
             """,
             (
-                json.dumps(metadata),
-                metadata.get("deadline"),
+                json.dumps(profile),
+                json.dumps(existing_meta),
+                deadline,
                 opp_id,
             ),
         )
@@ -269,8 +382,9 @@ def update_opportunity_metadata(opp_id: int, metadata: Dict[str, Any]) -> bool:
 
 
 def _parse_opportunity_row(row: sqlite3.Row) -> Dict[str, Any]:
-    """Convert a DB row into a dict with parsed metadata."""
+    """Convert a DB row into a dict with parsed metadata and profile."""
     item = dict(row)
+    item["is_curated"] = int(item.get("is_curated") or 0)
     meta_json = item.pop("metadata_json", None)
     if meta_json:
         try:
@@ -279,6 +393,16 @@ def _parse_opportunity_row(row: sqlite3.Row) -> Dict[str, Any]:
             item["metadata"] = None
     else:
         item["metadata"] = None
+
+    prof_json = item.pop("profile_json", None)
+    if prof_json:
+        try:
+            item["profile"] = json.loads(prof_json)
+        except Exception:
+            item["profile"] = None
+    else:
+        item["profile"] = None
+
     return item
 
 
@@ -287,15 +411,65 @@ def list_opportunities(
     source: Optional[str] = None,
     limit: int = 20,
     offset: int = 0,
+    include_curated: bool = True,
+    include_content: bool = True,
 ) -> Dict[str, Any]:
-    """List opportunities with pagination and optional search filter."""
+    """List opportunities with pagination, optional FTS5 full-text ranking, and content toggle."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
+        _ensure_opportunities_schema(cursor)
+
+        content_col = "content" if include_content else "'' as content"
+
+        # Attempt high-performance SQLite FTS5 search if a search query is provided
+        clean_tokens = [re.sub(r"[^\w]", "", t) for t in (query or "").split() if re.sub(r"[^\w]", "", t)]
+        if clean_tokens:
+            fts_query = " ".join(f'"{t}"*' for t in clean_tokens)
+            try:
+                base_from = "FROM opportunities o JOIN opportunities_fts fts ON o.id = fts.rowid"
+                where_clauses = ["opportunities_fts MATCH ?"]
+                params: List[Any] = [fts_query]
+
+                if not include_curated:
+                    where_clauses.append("(o.is_curated IS NULL OR o.is_curated = 0)")
+
+                if source:
+                    where_clauses.append("o.source = ?")
+                    params.append(source)
+
+                where_sql = " AND ".join(where_clauses)
+                count_sql = f"SELECT COUNT(*) as total {base_from} WHERE {where_sql}"
+                cursor.execute(count_sql, params)
+                total = cursor.fetchone()["total"]
+
+                data_sql = (
+                    f"SELECT o.id, o.title, o.{content_col}, o.source, o.url, o.created_at, "
+                    f"o.metadata_json, o.deadline, o.profile_json, o.is_curated "
+                    f"{base_from} WHERE {where_sql} "
+                    f"ORDER BY fts.rank ASC, o.id DESC LIMIT ? OFFSET ?"
+                )
+                cursor.execute(data_sql, params + [limit, offset])
+                rows = [_parse_opportunity_row(r) for r in cursor.fetchall()]
+
+                return {
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "items": rows,
+                }
+            except Exception:
+                # Graceful fallback to standard LIKE query if FTS query syntax fails
+                pass
+
+        # Standard non-FTS query or fallback
         sql = (
-            "SELECT id, title, content, source, url, created_at, "
-            "metadata_json, deadline FROM opportunities WHERE 1=1"
+            f"SELECT id, title, {content_col}, source, url, created_at, "
+            f"metadata_json, deadline, profile_json, is_curated FROM opportunities WHERE 1=1"
         )
-        params: List[Any] = []
+        params = []
+
+        if not include_curated:
+            sql += " AND (is_curated IS NULL OR is_curated = 0)"
 
         if query:
             sql += " AND (title LIKE ? OR content LIKE ?)"
@@ -325,17 +499,106 @@ def list_opportunities(
         }
 
 
+def list_curated_opportunities(limit: int = 100) -> List[Dict[str, Any]]:
+    """List curated roundup / Top-N directory opportunities."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        _ensure_opportunities_schema(cursor)
+        cursor.execute(
+            """
+            SELECT id, title, content, source, url, created_at,
+                   metadata_json, deadline, profile_json, is_curated
+            FROM opportunities
+            WHERE is_curated = 1
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = [_parse_opportunity_row(r) for r in cursor.fetchall()]
+        return [r for r in rows if is_english_content(r.get("title", ""), r.get("content", ""))]
+
+
 def get_opportunity_by_id(opp_id: int) -> Optional[Dict[str, Any]]:
     """Get single opportunity by ID."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
+        _ensure_opportunities_schema(cursor)
         cursor.execute(
             (
                 "SELECT id, title, content, source, url, created_at, "
-                "metadata_json, deadline FROM opportunities WHERE id = ?"
+                "metadata_json, deadline, profile_json, is_curated FROM opportunities WHERE id = ?"
             ),
             (opp_id,),
         )
         row = cursor.fetchone()
         return _parse_opportunity_row(row) if row else None
+
+
+
+def get_opportunity_by_title_or_query(query_or_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieve full opportunity row by ID or fuzzy title search."""
+    if not query_or_id or not str(query_or_id).strip():
+        return None
+
+    clean_query = str(query_or_id).strip()
+    if clean_query.isdigit():
+        return get_opportunity_by_id(int(clean_query))
+
+    import re
+    cleaned = re.sub(
+        r"^(?:can\s+you\s+)?(?:please\s+)?(?:give\s+me|tell\s+me|show\s+me|find|get)\s+(?:all\s+|full\s+|more\s+)?(?:details|information|info)?\s*(?:about|on|for|regarding)?\s*",
+        "",
+        clean_query,
+        flags=re.IGNORECASE,
+    ).strip()
+    search_query = cleaned if cleaned else clean_query
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        _ensure_opportunities_schema(cursor)
+
+        # 1. Exact or broad substring match on title
+        cursor.execute(
+            """
+            SELECT id, title, content, source, url, created_at,
+                   metadata_json, deadline, profile_json, is_curated
+            FROM opportunities
+            WHERE lower(title) LIKE ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (f"%{search_query.lower()}%",),
+        )
+        row = cursor.fetchone()
+        if row:
+            return _parse_opportunity_row(row)
+
+        # 2. Token-based fallback match (filtering stopwords and noise tokens)
+        stopwords = {
+            "the", "for", "and", "in", "at", "to", "of", "a", "an", "on",
+            "scholarship", "internship", "fellowship", "program", "programs",
+            "give", "tell", "show", "details", "detail", "about", "full", "all",
+            "info", "information", "with", "what", "is", "are", "how", "apply", "me", "you",
+            "options", "option", "latest", "available", "can", "good", "best", "some", "any", "find",
+            "looking", "want", "need",
+        }
+        words = [w for w in re.split(r"\W+", search_query.lower()) if len(w) > 2 and w not in stopwords]
+        if words:
+            like_clauses = " AND ".join(["lower(title) LIKE ?" for _ in words[:3]])
+            params = [f"%{w}%" for w in words[:3]]
+            cursor.execute(
+                f"""
+                SELECT id, title, content, source, url, created_at,
+                       metadata_json, deadline, profile_json, is_curated
+                FROM opportunities
+                WHERE {like_clauses}
+                ORDER BY LENGTH(title) ASC, id DESC LIMIT 1
+                """,
+                tuple(params),
+            )
+            row = cursor.fetchone()
+            if row:
+                return _parse_opportunity_row(row)
+
+    return None
 

@@ -24,8 +24,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: astral-sh/ruff-action@v3
-        with:
-          version: "0.16.4"
 
       - run: ruff check .
 
@@ -35,15 +33,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # Covers modules under test: backend.metadata_extractor -> config ->
-      # pydantic-settings/dateparser, backend.rate_limit -> fastapi/starlette (+httpx TestClient).
-      - name: Install test dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest dateparser pydantic-settings fastapi httpx
+      - name: Install dependencies
+        run: uv pip install --system pytest -r requirements.txt
 
       - run: python -m pytest tests/ -v

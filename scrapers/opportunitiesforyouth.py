@@ -1,4 +1,4 @@
-from bs4 import BeautifulSoup
+﻿from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 import re
 from slugify import slugify
@@ -50,7 +50,7 @@ class OpportunitiesForYouth:
 
     @staticmethod
     def slugify_links(u):
-        seg = u.split("/")[-1]
+        seg = u.rstrip("/").split("/")[-1]
         s   = slugify(seg)
         return re.sub(r'-(\d{4}|\d{4}-\d{2}-\d{2})$', '', s)
 

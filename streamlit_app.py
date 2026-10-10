@@ -1,3 +1,4 @@
+import html
 import json
 import os
 import sys
@@ -6,6 +7,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from config import settings
+from backend.text_utils import clean_opportunity_title, strip_thinking_tags
 
 # Parse CLI debug flag (e.g. streamlit run streamlit_app.py -- --debug) or environment variable
 CLI_DEBUG_FLAG: bool = (
@@ -16,6 +18,46 @@ CLI_DEBUG_FLAG: bool = (
 )
 
 DEFAULT_API_URL = f"http://{settings.api.host}:{settings.api.port}"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_opportunities_cached(base_url: str, query: str = "", limit: int = 500):
+    """Cached lightweight opportunity fetcher without heavy raw content payload."""
+    params = {"limit": limit, "offset": 0, "include_content": "false"}
+    if query.strip():
+        params["query"] = query.strip()
+    try:
+        resp = requests.get(f"{base_url}/api/v1/opportunities", params=params, timeout=15)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def check_backend_health_cached(base_url: str):
+    """Cached lightweight health check to prevent spamming backend on every rerun."""
+    try:
+        resp = requests.get(f"{base_url}/api/v1/health", timeout=2)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_sessions_cached(base_url: str):
+    """Cached session list to prevent querying DB on every rerun during chat."""
+    try:
+        resp = requests.get(f"{base_url}/api/v1/sessions", timeout=3)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return []
+
 
 st.set_page_config(page_title="Opportunity Details RAG Platform", page_icon="🎓", layout="wide")
 
@@ -323,20 +365,12 @@ sessions_list = []
 docs_count = 0
 device_type = "cpu"
 
-try:
-    health_resp = requests.get(f"{api_url}/api/v1/health", timeout=3)
-    if health_resp.status_code == 200:
-        backend_online = True
-        health_data = health_resp.json()
-        docs_count = health_data.get("docs_count", 0)
-        device_type = health_data.get("device", "cpu")
-        
-        # Fetch sessions from API v1
-        sess_resp = requests.get(f"{api_url}/api/v1/sessions", timeout=3)
-        if sess_resp.status_code == 200:
-            sessions_list = sess_resp.json()
-except Exception:
-    pass
+health_data = check_backend_health_cached(api_url)
+if health_data:
+    backend_online = True
+    docs_count = health_data.get("docs_count", 0)
+    device_type = health_data.get("device", "cpu")
+    sessions_list = fetch_sessions_cached(api_url)
 
 # --- SIDEBAR: 1. CHAT SESSIONS ---
 st.sidebar.title("Chat Sessions")
@@ -367,7 +401,6 @@ with col1:
         options=session_keys,
         format_func=lambda x: session_map.get(x, x),
         index=current_index,
-        key="session_select_box",
         label_visibility="collapsed"
     )
     if selected_sid != st.session_state.active_session_id:
@@ -380,58 +413,68 @@ with col2:
         if backend_online:
             try:
                 requests.post(f"{api_url}/api/v1/sessions", json={"title": "New Chat"}, timeout=3)
+                fetch_sessions_cached.clear()
             except Exception:
                 pass
         st.session_state.active_session_id = new_sid
-        st.session_state["session_select_box"] = new_sid
         st.rerun()
 
 if st.sidebar.button("🗑️ Delete Current Chat", use_container_width=True):
+    cur_sid = st.session_state.active_session_id
     if backend_online:
         try:
-            requests.delete(f"{api_url}/api/v1/sessions/{st.session_state.active_session_id}", timeout=3)
+            requests.delete(f"{api_url}/api/v1/sessions/{cur_sid}", timeout=3)
+            fetch_sessions_cached.clear()
         except Exception:
             pass
-    new_sid = str(uuid.uuid4())
-    st.session_state.active_session_id = new_sid
-    st.session_state["session_select_box"] = new_sid
+    remaining_keys = [k for k in session_keys if k != cur_sid]
+    st.session_state.active_session_id = remaining_keys[0] if remaining_keys else str(uuid.uuid4())
     st.rerun()
 
 # --- SIDEBAR: 2. MODEL & RAG OPTIONS ---
 st.sidebar.markdown("---")
 st.sidebar.title("Model & RAG Options")
 think = st.sidebar.toggle("Think Mode", value=False)
-rerank = st.sidebar.toggle("Rerank Retrieved Docs", value=True)
-selected_provider = st.sidebar.selectbox("Select Model Provider", options=["Ollama", "LLamaCPP"])
+provider_options = ["Ollama", "LLamaCPP"]
+model_type_val = getattr(settings.model, "model_type", None) or getattr(settings.model, "main_model", "")
+default_provider_idx = 1 if any(k in str(model_type_val).lower() for k in ("llamacpp", "llama_cpp", "gguf")) else 0
+selected_provider = st.sidebar.selectbox("Select Model Provider", options=provider_options, index=default_provider_idx)
 debug_mode = CLI_DEBUG_FLAG
+
+# Default rerank setting is OFF (False)
+rerank = False
+
+# --- SIDEBAR: 3. DEBUG OPTIONS (Only visible when CLI --debug is active) ---
 if debug_mode:
+    st.sidebar.markdown("---")
+    st.sidebar.title("🐞 Debug Options")
     st.sidebar.caption("🐞 *Debug Mode active via CLI flag (`--debug`)*")
+    if backend_online:
+        st.sidebar.success(f"Backend Connected ({docs_count} docs indexed, {device_type})")
+    rerank = st.sidebar.toggle("Rerank Documents", value=False, help="Enable CrossEncoder re-ranking of retrieved document chunks")
 
-# --- SIDEBAR: 3. BACKGROUND SCRAPER ---
-st.sidebar.markdown("---")
-st.sidebar.title("🕸️ Background Scraper")
+    st.sidebar.markdown("##### 🕸️ Background Scraper")
+    col_sc1, col_sc2 = st.sidebar.columns([1, 1])
+    with col_sc1:
+        if st.button("Run Scraper", help="Trigger web scrapers to fetch latest opportunities"):
+            try:
+                scrape_resp = requests.post(f"{api_url}/api/v1/scrape", json={"days_back": 30, "score_threshold": 0.7}, timeout=5)
+                if scrape_resp.status_code == 200:
+                    st.sidebar.info("Scraper background job started!")
+                else:
+                    st.sidebar.error("Failed to start scraper.")
+            except Exception as e:
+                st.sidebar.error(f"Scraper request error: {e}")
 
-col_sc1, col_sc2 = st.sidebar.columns([1, 1])
-with col_sc1:
-    if st.button("Run Scraper", help="Trigger web scrapers to fetch latest opportunities"):
-        try:
-            scrape_resp = requests.post(f"{api_url}/api/v1/scrape", json={"days_back": 30, "score_threshold": 0.7}, timeout=5)
-            if scrape_resp.status_code == 200:
-                st.sidebar.info("Scraper background job started!")
-            else:
-                st.sidebar.error("Failed to start scraper.")
-        except Exception as e:
-            st.sidebar.error(f"Scraper request error: {e}")
-
-with col_sc2:
-    if st.button("Check Status"):
-        try:
-            status_resp = requests.get(f"{api_url}/api/v1/scrape/status", timeout=3)
-            if status_resp.status_code == 200:
-                s_data = status_resp.json()
-                st.sidebar.info(f"Status: {s_data.get('status')}\nItems: {s_data.get('items_scraped')}")
-        except Exception:
-            st.sidebar.warning("Status check failed.")
+    with col_sc2:
+        if st.button("Check Status"):
+            try:
+                status_resp = requests.get(f"{api_url}/api/v1/scrape/status", timeout=3)
+                if status_resp.status_code == 200:
+                    s_data = status_resp.json()
+                    st.sidebar.info(f"Status: {s_data.get('status')}\nItems: {s_data.get('items_scraped')}")
+            except Exception:
+                st.sidebar.warning("Status check failed.")
 
 # --- SIDEBAR: 4. CONFIGURATION ---
 st.sidebar.markdown("---")
@@ -441,69 +484,9 @@ if api_url_input != api_url:
     st.session_state["backend_api_url"] = api_url_input
     st.rerun()
 
-if backend_online:
-    st.sidebar.success(f"Backend Connected ({docs_count} docs indexed, {device_type})")
-else:
+if not backend_online:
     st.sidebar.error("Cannot connect to FastAPI backend. Is it running?")
 
-def clean_pill_text(val: str) -> str:
-    """Clean markdown bold/italic tags and extra quotes from pill text, returning empty if placeholder/blank."""
-    if not val:
-        return ""
-    cleaned = val.replace("**", "").replace("*", "").replace("`", "").strip()
-    if cleaned.lower() in ("", "n/a", "none", "null", "unknown", "not specified"):
-        return ""
-    return cleaned
-
-# Helper function to render styled HTML pill badges
-def render_pill_badges(card: dict) -> str:
-    """Build styled HTML pill badges for opportunity metadata."""
-    pills = []
-    dl = clean_pill_text(card.get("deadline", ""))
-    org = clean_pill_text(card.get("organization", ""))
-    loc = clean_pill_text(card.get("location", ""))
-    tp = clean_pill_text(card.get("type", ""))
-
-    if dl:
-        pills.append(f'<span style="background-color:#f0e6ff; color:#6b21a8; padding:4px 12px; border-radius:14px; font-size:13px; font-weight:500; margin-right:6px; display:inline-block; margin-bottom:6px;">Deadline: {dl}</span>')
-    if org:
-        pills.append(f'<span style="background-color:#e0f2fe; color:#0369a1; padding:4px 12px; border-radius:14px; font-size:13px; font-weight:500; margin-right:6px; display:inline-block; margin-bottom:6px;">Organization: {org}</span>')
-    if loc:
-        pills.append(f'<span style="background-color:#dcfce7; color:#15803d; padding:4px 12px; border-radius:14px; font-size:13px; font-weight:500; margin-right:6px; display:inline-block; margin-bottom:6px;">Location: {loc}</span>')
-    if tp:
-        pills.append(f'<span style="background-color:#fef3c7; color:#b45309; padding:4px 12px; border-radius:14px; font-size:13px; font-weight:500; margin-right:6px; display:inline-block; margin-bottom:6px;">Type: {tp}</span>')
-
-    if pills:
-        return '<div style="margin-top:4px; margin-bottom:10px;">' + "".join(pills) + '</div>'
-    return ""
-
-def format_message_with_inline_pills(text: str) -> str:
-    """Converts key-value bullet lines inline into styled HTML Pill Badges."""
-    lines = text.split("\n")
-    formatted_lines = []
-
-    for line in lines:
-        line_clean = line.strip()
-        if "Deadline:" in line_clean or "Organization:" in line_clean or "Location:" in line_clean:
-            parts = [p.strip().lstrip("•*- ").strip() for p in line_clean.split("|")]
-            card_dict = {}
-            for part in parts:
-                if ":" in part:
-                    k, v = part.split(":", 1)
-                    key_norm = k.strip().lower()
-                    val_clean = clean_pill_text(v)
-                    if key_norm in ("deadline", "organization", "location", "type"):
-                        card_dict[key_norm] = val_clean
-
-            pills_html = render_pill_badges(card_dict)
-            if pills_html:
-                formatted_lines.append(pills_html)
-            else:
-                formatted_lines.append(line)
-        else:
-            formatted_lines.append(line)
-
-    return "\n".join(formatted_lines)
 
 # Main Navigation Tabs
 tab_chat, tab_opps = st.tabs(["💬 Chat Assistant", "🔍 Explore Opportunities"])
@@ -513,9 +496,37 @@ with tab_chat:
 
 
 
+    def render_tool_status_badge(used_tools: list, metadata: dict = None, target_container=None) -> None:
+        """Render non-expandable static badge showing only the tool use words (no expander, no details, no empty box)."""
+        if not used_tools:
+            return
+        target = target_container if target_container is not None else st
+        seen_labels = set()
+        badge_htmls = []
+        for tool in used_tools:
+            tool_str = str(tool).lower()
+            label = None
+            if "web" in tool_str:
+                label = "🌐 Searched the web"
+            elif any(k in tool_str for k in ("lookup", "deep", "curated")):
+                label = "🔍 Deep Dived"
+
+            if label and label not in seen_labels:
+                seen_labels.add(label)
+                badge_htmls.append(
+                    f'<div style="display:inline-flex;align-items:center;padding:3px 10px;margin-right:6px;margin-bottom:8px;border-radius:14px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);font-size:0.82rem;font-weight:500;color:#9ca3af;user-select:none;">'
+                    f'<span>{label}</span></div>'
+                )
+
+        if badge_htmls:
+            target.markdown(
+                f'<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px;">{"".join(badge_htmls)}</div>',
+                unsafe_allow_html=True,
+            )
+
     def render_debug_inspector(meta: dict) -> None:
         """Render interactive debug panel with prompt templates, variables, and retrieved docs."""
-        if not meta:
+        if not debug_mode or not meta:
             return
 
         dbg = meta.get("debug_info") or {}
@@ -547,6 +558,33 @@ with tab_chat:
                 st.markdown("**RAG Context Snippet:**")
                 st.code(dbg.get("context_text_snippet", "No RAG context used."))
 
+    @st.cache_data(ttl=60)
+    def fetch_curated_chips(url: str):
+        default_chips = [
+            {"title": "✨ Top Scholarships Currently Open", "query": "Top Scholarships Currently Open"},
+            {"title": "✨ Top 10 Fully Funded Scholarships", "query": "Top 10 Fully Funded Scholarships"},
+        ]
+        try:
+            resp = requests.get(f"{url}/api/v1/opportunities/curated", timeout=2)
+            if resp.status_code == 200:
+                items = resp.json()
+                if items:
+                    fetched = [{"title": f"✨ {it.get('title', '').title()}", "query": it.get("title", "")} for it in items if it.get("title")]
+                    seen = set()
+                    unique_chips = []
+                    for item in fetched:
+                        norm = item["query"].lower().strip()
+                        if norm not in seen:
+                            seen.add(norm)
+                            unique_chips.append(item)
+                    if unique_chips:
+                        return unique_chips[:2]
+        except Exception:
+            pass
+        return default_chips
+
+    chip_prompt = None
+
     # Fetch message history for active session from API v1
     messages = []
     if backend_online and st.session_state.active_session_id:
@@ -560,16 +598,35 @@ with tab_chat:
     # Container for chat message history
     chat_container = st.container()
     with chat_container:
+        if not messages:
+            st.markdown("Search, query, and deep-dive into verified global scholarships, fellowships, and internships.")
+            st.markdown("**🌟 Popular & Curated Opportunity Roundups:**")
+            chips = fetch_curated_chips(api_url) if backend_online else [
+                {"title": "✨ Top Scholarships Currently Open", "query": "Top Scholarships Currently Open"},
+                {"title": "✨ Top 10 Fully Funded Scholarships", "query": "Top 10 Fully Funded Scholarships"},
+            ]
+            chip_cols = st.columns(len(chips))
+            for idx, c in enumerate(chips):
+                with chip_cols[idx]:
+                    if st.button(c["title"], key=f"chip_welcome_{idx}", use_container_width=True):
+                        chip_prompt = c["query"]
+
         for message in messages:
             with st.chat_message(message["role"]):
-                if message["role"] == "assistant":
-                    formatted_html = format_message_with_inline_pills(message["content"])
-                    st.markdown(formatted_html, unsafe_allow_html=True)
-                else:
-                    st.markdown(message["content"])
-
                 meta = message.get("metadata") or {}
-                if meta.get("debug") or meta.get("debug_info"):
+                if message["role"] == "assistant":
+                    used_tools = meta.get("used_tools") or meta.get("debug_info", {}).get("used_tools", [])
+                    if used_tools:
+                        render_tool_status_badge(used_tools, metadata=meta)
+
+                    think_trace = meta.get("thinking")
+                    if think_trace and think:
+                        with st.status("💭 Thinking Process", expanded=False):
+                            st.markdown(think_trace)
+
+                st.markdown(strip_thinking_tags(message["content"]))
+
+                if debug_mode and (meta.get("debug") or meta.get("debug_info")):
                     render_debug_inspector(meta)
                 elif meta.get("is_opportunity"):
                     docs = meta.get("initial_docs", [])
@@ -649,7 +706,7 @@ with tab_chat:
 
     # Fixed bottom chat input at root level
     text_prompt = st.chat_input("Ask about scholarships, internships, or opportunities...")
-    prompt = voice_prompt or text_prompt
+    prompt = chip_prompt or voice_prompt or text_prompt
 
     if prompt:
         with chat_container:
@@ -676,71 +733,100 @@ with tab_chat:
                 thinking_status = None
                 thinking_text_placeholder = None
                 thinking_completed = False
+                full_thinking = ""
+                tool_status_container = st.container()
+                tools_badge_rendered = False
                 response_placeholder = st.empty()
                 full_raw_response = ""
                 metadata_received = None
 
                 try:
-                    with requests.post(f"{api_url}/api/v1/chat/stream", json=payload, stream=True, timeout=120) as resp:
+                    with requests.post(f"{api_url}/api/v1/chat/stream", json=payload, stream=True, timeout=(15, 180)) as resp:
                         if resp.status_code != 200:
                             st.error(f"API returned error status {resp.status_code}: {resp.text}")
                         else:
+                            line_buf = ""
                             for chunk in resp.iter_content(chunk_size=None, decode_unicode=True):
                                 if not chunk:
                                     continue
+                                line_buf += chunk
+                                while "\n" in line_buf:
+                                    line, line_buf = line_buf.split("\n", 1)
+                                    line_s = line.strip()
+                                    if not line_s:
+                                        continue
 
-                                if "[[METADATA]]" in chunk:
-                                    lines = chunk.split("\n")
-                                    for line in lines:
-                                        if line.startswith("[[METADATA]]"):
-                                            meta_str = line.replace("[[METADATA]]", "").strip()
+                                    if line_s.startswith("[[METADATA]]"):
+                                        try:
+                                            metadata_received = json.loads(line_s[len("[[METADATA]]"):].strip())
+                                        except Exception:
+                                            pass
+                                        if metadata_received and not tools_badge_rendered:
+                                            used_tools = metadata_received.get("used_tools") or metadata_received.get("debug_info", {}).get("used_tools", [])
+                                            if used_tools:
+                                                render_tool_status_badge(used_tools, metadata=metadata_received, target_container=tool_status_container)
+                                                tools_badge_rendered = True
+                                        continue
+
+                                    if line_s.startswith("[[THINK]]"):
+                                        if think:
                                             try:
-                                                metadata_received = json.loads(meta_str)
+                                                think_tok = json.loads(line_s[len("[[THINK]]"):].strip())
                                             except Exception:
-                                                pass
-                                        else:
-                                            full_raw_response += line
-                                    continue
+                                                think_tok = line_s[len("[[THINK]]"):]
+                                            full_thinking += think_tok
+                                            if thinking_status is None:
+                                                thinking_status = st.status("💭 Thinking Process...", expanded=False)
+                                            with thinking_status:
+                                                if thinking_text_placeholder is None:
+                                                    thinking_text_placeholder = st.empty()
+                                                thinking_text_placeholder.markdown(full_thinking)
+                                        continue
 
-                                full_raw_response += chunk
-
-                                display_text = full_raw_response
-
-                                if "<think>" in display_text:
-                                    think_start = display_text.find("<think>") + len("<think>")
-                                    think_end = display_text.find("</think>")
-
-                                    if think_end != -1:
-                                        thinking_content = display_text[think_start:think_end]
-                                        response_content = display_text[think_end + len("</think>") :]
-                                        if not thinking_completed:
+                                    if line_s.startswith("[[CONTENT]]"):
+                                        if thinking_status is not None and not thinking_completed:
                                             thinking_completed = True
-                                            if thinking_status is not None:
-                                                thinking_status.update(label="Thinking complete!", state="complete", expanded=False)
-                                    else:
-                                        thinking_content = display_text[think_start:]
-                                        response_content = ""
-                                else:
-                                    thinking_content = ""
-                                    response_content = display_text
+                                            thinking_status.update(label="Thinking finished", state="complete", expanded=False)
+                                        try:
+                                            content_tok = json.loads(line_s[len("[[CONTENT]]"):].strip())
+                                        except Exception:
+                                            content_tok = line_s[len("[[CONTENT]]"):]
+                                        full_raw_response += content_tok
+                                        response_placeholder.markdown(full_raw_response)
+                                        continue
 
-                                if thinking_content:
-                                    if thinking_status is None:
-                                        thinking_status = st.status("Thinking...", expanded=True)
-                                    with thinking_status:
-                                        if thinking_text_placeholder is None:
-                                            thinking_text_placeholder = st.empty()
-                                        thinking_text_placeholder.markdown(thinking_content)
+                                    # Fallback for unexpected non-tagged line
+                                    if thinking_status is not None and not thinking_completed:
+                                        thinking_completed = True
+                                        thinking_status.update(label="Thinking finished", state="complete", expanded=False)
+                                    clean_chunk = strip_thinking_tags(line) if "<think>" in line else line
+                                    if clean_chunk:
+                                        full_raw_response += clean_chunk
+                                        response_placeholder.markdown(full_raw_response)
 
-                                if response_content:
-                                    formatted_live = format_message_with_inline_pills(response_content)
-                                    response_placeholder.markdown(formatted_live, unsafe_allow_html=True)
+                            if line_buf.strip():
+                                line_s = line_buf.strip()
+                                if line_s.startswith("[[CONTENT]]"):
+                                    try:
+                                        content_tok = json.loads(line_s[len("[[CONTENT]]"):].strip())
+                                        full_raw_response += content_tok
+                                    except Exception:
+                                        pass
+                                elif not line_s.startswith("[["):
+                                    full_raw_response += line_s
+                                response_placeholder.markdown(full_raw_response)
 
                     if thinking_status is not None and not thinking_completed:
                         thinking_status.update(label="Thinking finished", state="complete", expanded=False)
 
+                    if metadata_received and not tools_badge_rendered:
+                        used_tools = metadata_received.get("used_tools") or metadata_received.get("debug_info", {}).get("used_tools", [])
+                        if used_tools:
+                            render_tool_status_badge(used_tools, metadata=metadata_received, target_container=tool_status_container)
+                            tools_badge_rendered = True
+
                     if metadata_received:
-                        if metadata_received.get("debug") or metadata_received.get("debug_info"):
+                        if debug_mode and (metadata_received.get("debug") or metadata_received.get("debug_info")):
                             render_debug_inspector(metadata_received)
                         elif metadata_received.get("is_opportunity"):
                             docs = metadata_received.get("initial_docs", [])
@@ -756,39 +842,140 @@ with tab_chat:
 
 # --- TAB 2: EXPLORE OPPORTUNITIES ---
 with tab_opps:
-    st.subheader("📚 Scraped Opportunities Database")
-    st.markdown("Browse and search opportunities indexed in the SQLite database via `/api/v1/opportunities` endpoint.")
+    st.subheader("Explore Opportunities")
 
-    col_q, col_lim = st.columns([4, 1])
-    with col_q:
-        search_query = st.text_input("Search Opportunities by Keyword", value="", placeholder="e.g. Masters, Germany, Fully Funded, Fellowship...")
-    with col_lim:
-        page_size = st.selectbox("Page Size", options=[10, 20, 50], index=1)
+    search_query = st.text_input(
+        "Search Opportunities by Keyword",
+        value="",
+        placeholder="e.g. Masters, Germany, Fully Funded, Fellowship, Physics...",
+    )
 
     if backend_online:
         try:
-            params = {"limit": page_size, "offset": 0}
-            if search_query.strip():
-                params["query"] = search_query.strip()
-            
-            opp_resp = requests.get(f"{api_url}/api/v1/opportunities", params=params, timeout=5)
-            if opp_resp.status_code == 200:
-                opp_data = opp_resp.json()
+            # Manage pagination / progressive load in session state
+            if "explore_limit" not in st.session_state:
+                st.session_state.explore_limit = 50
+
+            last_search = st.session_state.get("last_explore_search", "")
+            if search_query != last_search:
+                st.session_state.last_explore_search = search_query
+                st.session_state.explore_limit = 50
+
+            opp_data = fetch_opportunities_cached(api_url, query=search_query, limit=500)
+            if opp_data:
                 total_items = opp_data.get("total", 0)
                 items = opp_data.get("items", [])
 
-                st.info(f"Found **{total_items}** opportunities matching your criteria.")
+                visible_limit = st.session_state.explore_limit
+                displayed_items = items[:visible_limit]
 
-                for idx, item in enumerate(items, 1):
-                    with st.expander(f"#{item['id']} - {item['title']}", expanded=False):
-                        if item.get("url"):
-                            st.markdown(f"🔗 **Source Link**: [{item['url']}]({item['url']})")
-                        if item.get("source"):
-                            st.caption(f"Source Portal: `{item['source']}` | Indexed At: `{item.get('created_at', '')}`")
-                        st.markdown(item["content"][:1500] + ("..." if len(item["content"]) > 1500 else ""))
+                if not items:
+                    st.info("No opportunities match your search criteria.")
+                else:
+                    if len(items) > len(displayed_items):
+                        st.caption(
+                            f"Showing **{len(displayed_items)}** of **{len(items)}** matching opportunities "
+                        )
+                    else:
+                        st.caption(
+                            f"Showing all **{len(items)}** matching opportunities (Total in Database: **{total_items}**)"
+                        )
+
+                    rows_parts = []
+                    for item in displayed_items:
+                        prof = item.get("profile") or {}
+                        meta = item.get("metadata") or {}
+
+                        raw_title = prof.get("title") or item.get("title") or "Untitled Opportunity"
+                        title = html.escape(clean_opportunity_title(raw_title))
+                        item_id = item.get("id")
+                        url = item.get("url") or ""
+                        source = html.escape(item.get("source") or "")
+
+                        opp_type = html.escape(prof.get("type") or meta.get("type") or "Opportunity")
+                        deadline = html.escape(prof.get("deadline") or meta.get("deadline") or item.get("deadline") or "Open / Unspecified")
+                        org = html.escape((prof.get("organization") or meta.get("organization") or "").strip())
+                        loc = html.escape((prof.get("location") or meta.get("location") or "").strip())
+                        summary = html.escape((prof.get("summary") or "Details available in the full announcement.").strip())
+
+                        benefits = html.escape((prof.get("benefits") or "").strip())
+                        eligibility = html.escape((prof.get("eligibility") or "").strip())
+
+                        title_markup = f'<a href="{url}" target="_blank" class="opp-title-link">{title} ↗</a>' if url else f'<span style="font-weight: 600; font-size: 1.05rem;">{title}</span>'
+
+                        meta_badges = f'<span class="opp-badge-type">{opp_type}</span>'
+                        if deadline and deadline.lower() not in ("open / unspecified", "unspecified", "not specified"):
+                            meta_badges += f' <span class="opp-badge-deadline">📅 {deadline}</span>'
+
+                        meta_info = []
+                        if org:
+                            meta_info.append(f'🏛️ <strong>{org}</strong>')
+                        if loc:
+                            meta_info.append(f'📍 {loc}')
+                        if source:
+                            meta_info.append(f'Portal: <code>{source}</code>')
+                        meta_info_str = " &bull; ".join(meta_info)
+
+                        extra_markup = ""
+                        if benefits and benefits.lower() != "not specified":
+                            extra_markup += f'<div class="opp-extra-detail"><strong>Benefits:</strong> {benefits}</div>'
+                        if eligibility and eligibility.lower() != "not specified":
+                            extra_markup += f'<div class="opp-extra-detail"><strong>Eligibility:</strong> {eligibility}</div>'
+
+                        row = (
+                            '<tr class="opp-table-row">'
+                            '<td style="width: 100%;">'
+                            f'<div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 6px;">'
+                            f'<div>{title_markup}</div>'
+                            f'<div>{meta_badges}</div>'
+                            '</div>'
+                            f'<div class="opp-meta-sub" style="margin-bottom: 8px;">{meta_info_str}</div>'
+                            f'<div class="opp-summary-text">{summary}</div>'
+                            f'{extra_markup}'
+                            '</td>'
+                            '</tr>'
+                        )
+                        rows_parts.append(row)
+
+                    all_rows = "".join(rows_parts)
+                    table_html = (
+                        '<style>'
+                        '.opp-table-container { width: 100%; overflow-x: auto; margin-top: 0.8rem; margin-bottom: 1.2rem; }'
+                        '.opp-borderless-table { width: 100%; border-collapse: collapse; border: none !important; }'
+                        '.opp-borderless-table tr { border: none !important; }'
+                        '.opp-borderless-table td { border: none !important; padding: 16px 14px; vertical-align: top; font-size: 0.9rem; line-height: 1.55; }'
+                        '.opp-table-row:nth-child(even) { background-color: rgba(128, 128, 128, 0.04); }'
+                        '.opp-table-row:hover { background-color: rgba(128, 128, 128, 0.08); }'
+                        '.opp-title-link { font-weight: 600; text-decoration: none; font-size: 1.05rem; color: #ff4b4b; }'
+                        '.opp-title-link:hover { text-decoration: underline; }'
+                        '.opp-badge-type { display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 0.78rem; font-weight: 600; background: rgba(255, 75, 75, 0.12); color: #ff4b4b; }'
+                        '.opp-badge-deadline { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 0.8rem; font-weight: 600; background: rgba(240, 136, 62, 0.15); color: #f0883e; }'
+                        '.opp-meta-sub { opacity: 0.72; font-size: 0.82rem; }'
+                        '.opp-summary-text { opacity: 0.92; font-size: 0.9rem; }'
+                        '.opp-extra-detail { margin-top: 6px; font-size: 0.84rem; opacity: 0.85; }'
+                        '</style>'
+                        '<div class="opp-table-container">'
+                        '<table class="opp-borderless-table">'
+                        f'<tbody>{all_rows}</tbody>'
+                        '</table>'
+                        '</div>'
+                    )
+                    st.markdown(table_html, unsafe_allow_html=True)
+
+                    # Progressive loading controls ("Load More")
+                    if len(items) > visible_limit:
+                        col_lm1, col_lm2, _ = st.columns([2, 2, 4])
+                        with col_lm1:
+                            if st.button("⬇️ Load 50 More", use_container_width=True):
+                                st.session_state.explore_limit += 50
+                                st.rerun()
+                        with col_lm2:
+                            if st.button(f"Show All ({len(items)})", use_container_width=True):
+                                st.session_state.explore_limit = len(items)
+                                st.rerun()
             else:
-                st.error(f"Failed to fetch opportunities from API: {opp_resp.status_code}")
+                st.error("Failed to fetch opportunities from API backend.")
         except Exception as e:
-            st.error(f"Error connecting to /api/v1/opportunities: {e}")
+            st.error(f"Error connecting to opportunities endpoint: {e}")
     else:
         st.warning("Backend API is currently offline. Start the backend service to browse opportunities.")
